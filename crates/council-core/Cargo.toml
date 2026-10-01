@@ -1,0 +1,32 @@
+[package]
+name = "council-core"
+version = "0.1.0"
+edition = "2021"
+description = "Debate engine for the Council chamber: multi-model deliberation over a shared board of points."
+license = "MIT"
+
+[features]
+default = ["tls"]
+# rustls pulls in `ring`, which needs a C toolchain. Everything the engine
+# itself does works over plain HTTP, so TLS can be switched off when building
+# somewhere without a compiler — useful for CI and for `cargo test`.
+tls = ["reqwest/rustls-tls"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "stream",
+    "http2",
+    "charset",
+] }
+
+[dev-dependencies]
+async-trait = "0.1"
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }

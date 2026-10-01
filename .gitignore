@@ -1,0 +1,55 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Rust
+target
+
+# Tauri — generated at build/dev time, plus installer artifacts
+src-tauri/gen
+*.AppImage
+*.deb
+*.rpm
+*.dmg
+*.app
+*.exe
+*.msi
+*.aab
+*.apk
+
+# Env & secrets — endpoint API keys live in localStorage, never in the tree
+.env
+.env.local
+*.pem
+*.key
+*.p12
+
+# Stale pre-rewrite duplicates of src/ (older App.tsx / CouncilRail.tsx).
+# Safe to delete — git has never tracked them.
+dillmmonouser/
+
+# Misc
+coverage
+*.tsbuildinfo
+.vite

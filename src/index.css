@@ -1,0 +1,628 @@
+@import "tailwindcss";
+
+/* Toggled from the top bar; dark is the default. */
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+/*
+  One tonal ladder, two themes. Light values live on :root and dark overrides
+  them on [data-theme="dark"], so every utility below follows the toggle
+  without a single dark: prefix.
+*/
+:root {
+  color-scheme: light;
+  --canvas: #e7f3f0;
+  --surface: #f7fcfb;
+  --surface-2: #dceee9;
+  --surface-3: #c5e3dc;
+  --line: #c6deda;
+  --line-2: #9dc0b8;
+  --ink: #122826;
+  --ink-2: #3e5f59;
+  --ink-3: #6e918a;
+  --primary: #19665f;
+  --primary-hover: #0f4a45;
+  --on-primary: #f2faf8;
+  --primary-soft: #c9e7e2;
+  --ok: #137333;
+  --warn: #9a5b00;
+  --bad: #c5221f;
+  --bad-soft: #fce8e6;
+  --focus: #19665f;
+  --shadow-1: 0 1px 2px rgb(20 24 30 / 0.06), 0 4px 16px -4px rgb(20 24 30 / 0.1);
+  --shadow-pop: 0 8px 32px -8px rgb(20 24 30 / 0.22);
+  --glow: 0 0 0 1px rgb(26 115 232 / 0.35), 0 4px 20px -2px rgb(26 115 232 / 0.45);
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+  --canvas: #0a1514;
+  --surface: #0f1f1d;
+  --surface-2: #173331;
+  --surface-3: #1f3f3c;
+  --line: #385e57;
+  --line-2: #4f7d74;
+  --ink: #eaf6f3;
+  --ink-2: #a7c4bd;
+  --ink-3: #8fb3ab;
+  --primary: #65ccc6;
+  --primary-hover: #8ad9d3;
+  --on-primary: #062723;
+  --primary-soft: #143937;
+  --ok: #81c995;
+  --warn: #fdd663;
+  --bad: #f28b82;
+  --bad-soft: #2a1614;
+  --focus: #65ccc6;
+  --shadow-1: 0 1px 2px rgb(0 0 0 / 0.4), 0 6px 24px -8px rgb(0 0 0 / 0.5);
+  --shadow-pop: 0 12px 44px -10px rgb(0 0 0 / 0.65);
+  --glow: 0 0 0 1px rgb(168 199 250 / 0.4), 0 4px 24px -2px rgb(168 199 250 / 0.35);
+}
+
+@theme inline {
+  --font-sans: "Google Sans Flex", "Google Sans", system-ui, -apple-system, "Segoe UI",
+    Roboto, sans-serif;
+  --font-mono: "Google Sans Code", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --color-canvas: var(--canvas);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-surface-3: var(--surface-3);
+  --color-line: var(--line);
+  --color-line-2: var(--line-2);
+  --color-ink: var(--ink);
+  --color-ink-2: var(--ink-2);
+  --color-ink-3: var(--ink-3);
+  --color-primary: var(--primary);
+  --color-primary-hover: var(--primary-hover);
+  --color-on-primary: var(--on-primary);
+  --color-primary-soft: var(--primary-soft);
+  --color-ok: var(--ok);
+  --color-warn: var(--warn);
+  --color-bad: var(--bad);
+  --color-bad-soft: var(--bad-soft);
+  --color-accent: var(--primary);
+
+  --radius-pill: 999px;
+  --radius-card: 12px;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    margin: 0;
+    background: var(--canvas);
+    color: var(--ink);
+    font-family: var(--font-sans);
+    font-variation-settings: "ROND" 40;
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+  }
+  [data-theme="dark"] body {
+    background-image:
+      radial-gradient(1200px 500px at 70% -10%, rgb(168 199 250 / 0.055), transparent 60%),
+      radial-gradient(900px 480px at 10% 110%, rgb(129 201 149 / 0.04), transparent 60%);
+    background-attachment: fixed;
+  }
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--line-2);
+    border-radius: 999px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--ink-3);
+    background-clip: content-box;
+    border: 2px solid transparent;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::selection {
+    background: var(--primary-soft);
+  }
+  input,
+  textarea,
+  select,
+  button {
+    font: inherit;
+    color: inherit;
+  }
+  :focus-visible {
+    outline: 2px solid var(--focus);
+    outline-offset: 2px;
+  }
+}
+
+@layer components {
+  /* One field, one look, everywhere. */
+  .field {
+    @apply w-full rounded-pill border border-transparent bg-surface-2 px-3.5 py-1.5
+      text-[13px] text-ink transition-colors;
+  }
+  .field:hover {
+    @apply border-line-2;
+  }
+  .field:focus {
+    @apply border-primary bg-surface outline-none;
+    box-shadow: 0 0 0 3px var(--primary-soft);
+  }
+  .field::placeholder {
+    @apply text-ink-3;
+  }
+  textarea.field {
+    border-radius: var(--radius-card);
+    line-height: 1.55;
+  }
+
+  .btn {
+    @apply inline-flex shrink-0 cursor-pointer items-center justify-center gap-1.5 rounded-pill
+      border border-line-2 bg-surface-2 px-3.5 py-1.5 text-[13px] font-medium text-ink
+      transition-all duration-150;
+  }
+  .btn:hover:not(:disabled) {
+    @apply bg-surface-3 -translate-y-px;
+    box-shadow: var(--shadow-1);
+  }
+  .btn:active:not(:disabled) {
+    @apply translate-y-0;
+  }
+  .btn:disabled {
+    @apply cursor-not-allowed opacity-40;
+  }
+  .btn-primary {
+    @apply border-transparent bg-primary text-on-primary;
+    box-shadow: var(--glow);
+  }
+  .btn-primary:hover:not(:disabled) {
+    @apply bg-primary-hover;
+  }
+  .btn-ghost {
+    @apply border-transparent bg-transparent text-ink-2;
+  }
+  .btn-ghost:hover:not(:disabled) {
+    @apply bg-surface-2 text-ink;
+    box-shadow: none;
+  }
+  .btn-danger {
+    @apply border-bad/60 bg-transparent text-bad;
+  }
+  .btn-danger:hover:not(:disabled) {
+    @apply bg-bad-soft;
+    box-shadow: none;
+  }
+
+  .chip {
+    @apply inline-flex items-center gap-1.5 rounded-pill border border-line
+      bg-surface-2 px-2.5 py-1 text-[11px] text-ink-2;
+  }
+
+  /*
+    Flat surfaces, not boxes-in-boxes. One hairline border, no shadow, and
+    content grouped by spacing and type weight. Nested cards are the fastest
+    way to make a dense tool look slopified, so nothing here stacks a card
+    inside a card: inner rows sit directly on the surface.
+  */
+  .card {
+    background: var(--surface-2);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-card);
+  }
+
+  .section-title {
+    @apply text-[11px] font-semibold tracking-[0.12em] text-ink-3 uppercase;
+  }
+
+  /* Seat avatar: a small colored disc with the seat's initial. */
+  .avatar {
+    @apply flex size-6 shrink-0 items-center justify-center rounded-full text-[11px] font-bold;
+    color: #0b0e13;
+  }
+
+  /* Status pills for speaking / next / skipped / live.
+     Deliberately no `ml-auto`: it used to live here, and in a row carrying two
+     or more pills the first one claimed the free space, so a "speaking" badge
+     appearing mid-debate split that space and shoved the label sideways. Every
+     row in the rail jittered once per turn. Auto-margin is now applied by the
+     one caller that wants a pill pushed to the far edge. */
+  .status-pill {
+    @apply inline-flex shrink-0 items-center gap-1 rounded-pill px-2 py-0.5
+      text-[9.5px] font-semibold tracking-[0.08em] uppercase;
+  }
+
+  /* A proportional win/lose/stalemate strip. */
+  .spread {
+    @apply flex h-1.5 w-full gap-px overflow-hidden rounded-full bg-surface-3;
+  }
+  .spread > i {
+    @apply block h-full min-w-1 rounded-full transition-all duration-500;
+  }
+
+  /* Poll option bars. */
+  .bar {
+    @apply relative h-6 overflow-hidden rounded-lg bg-surface-3;
+  }
+  .bar > i {
+    @apply absolute inset-y-0 left-0 rounded-lg transition-all duration-500;
+    background: linear-gradient(90deg, var(--primary-soft), var(--primary-soft));
+    border: 1px solid var(--line-2);
+  }
+  .bar.leader > i {
+    background: linear-gradient(90deg, rgb(26 115 232 / 0.25), rgb(26 115 232 / 0.45));
+    border-color: var(--primary);
+  }
+  [data-theme="dark"] .bar.leader > i {
+    background: linear-gradient(90deg, rgb(168 199 250 / 0.18), rgb(168 199 250 / 0.38));
+  }
+
+  /* Transcript action rows: tool tag + prose. */
+  .act-tag {
+    @apply mt-0.5 shrink-0 rounded-md px-1.5 py-px font-mono text-[10px] font-medium tracking-wide;
+    background: var(--primary-soft);
+    color: var(--primary);
+  }
+
+  /* Every tag used to be this one pill, so a transcript with thirty rows per
+     seat could not be scanned for the two that mattered: what was refused, and
+     what the council read. Kind is now legible at a glance, and the words are
+     still there for anyone who needs them. */
+  .act-tag[data-tag="vote"],
+  .act-tag[data-tag="re-vote"] {
+    background: color-mix(in oklab, var(--ok) 16%, transparent);
+    color: var(--ok);
+  }
+  .act-tag[data-tag="concede"],
+  .act-tag[data-tag="withdraw"],
+  .act-tag[data-tag="adjourn"],
+  .act-tag[data-tag="review"] {
+    background: color-mix(in oklab, var(--bad) 16%, transparent);
+    color: var(--bad);
+  }
+  .act-tag[data-tag="ruling"] {
+    background: var(--primary);
+    color: var(--on-primary);
+  }
+  .act-tag[data-tag="stalemate"],
+  .act-tag[data-tag="extension"],
+  .act-tag[data-tag="read"],
+  .act-tag[data-tag="search"] {
+    background: color-mix(in oklab, var(--warn) 18%, transparent);
+    color: var(--warn);
+  }
+  .act-tag[data-tag="rejected"],
+  .act-tag[data-tag="failed"],
+  .act-tag[data-tag="empty"] {
+    background: color-mix(in oklab, var(--bad) 45%, transparent);
+    color: var(--bad);
+  }
+  .act-tag[data-tag="idle"] {
+    background: transparent;
+    color: var(--ink-3);
+  }
+  .act-tag[data-tag="result"],
+  .act-tag[data-tag="closing"] {
+    background: var(--primary);
+    color: var(--on-primary);
+  }
+
+  /* The chamber is setup, transcript, board — but which of those exist depends
+     on what the operator has toggled, so the columns are chosen by attribute
+     rather than by an inline string. That is what lets the same rules serve the
+     live chamber and the reader, and what stops a hidden panel from leaving a
+     dead gap beside the transcript. */
+  .chamber {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .chamber[data-left="1"][data-right="1"] {
+    grid-template-columns: 292px minmax(0, 1fr) 376px;
+  }
+  .chamber[data-left="1"][data-right="0"] {
+    grid-template-columns: 292px minmax(0, 1fr);
+  }
+  .chamber[data-left="0"][data-right="1"] {
+    grid-template-columns: minmax(0, 1fr) 376px;
+  }
+
+  /* Below this the board moves under the transcript rather than squeezing it.
+     At 1180px three columns left the transcript a few hundred pixels, which is
+     where reading a six-round debate stops being possible. */
+  @media (max-width: 1180px) {
+    .chamber[data-left="1"] {
+      grid-template-columns: 268px minmax(0, 1fr);
+    }
+    .chamber[data-left="0"] {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .chamber {
+      overflow-y: auto;
+    }
+    .chamber > .chamber-right {
+      grid-column: 1 / -1;
+      max-height: 46vh;
+      overflow-y: auto;
+      border-left: 0;
+      border-top: 1px solid var(--line);
+    }
+  }
+
+  /* Narrower still, the setup panel stacks too and the transcript gets the room.
+     It is capped rather than free: a full-height setup panel on a phone leaves
+     nothing to read. */
+  @media (max-width: 880px) {
+    .chamber[data-left="1"] {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .chamber {
+      overflow-y: auto;
+    }
+    .chamber > .chamber-left {
+      max-height: 38vh;
+      overflow-y: auto;
+      border-right: 0;
+      border-bottom: 1px solid var(--line);
+    }
+  }
+
+  /* Scroll regions that gain and lose their scrollbar as content streams in.
+     Without a reserved gutter the whole column shifts sideways each time the
+     bar appears — the transcript, the rail and the board all did this
+     mid-debate. Unsupported engines ignore the declaration. */
+  .stable-gutter {
+    scrollbar-gutter: stable;
+  }
+  /* Thinking: one dashed hairline, full-width toggle row, React-owned. */
+  .thought {
+    @apply mt-2 rounded-lg border border-dashed border-line-2;
+  }
+  .thought-toggle {
+    @apply flex w-full cursor-pointer items-center gap-1.5 rounded-lg px-2.5 py-1.5
+      text-[11.5px] text-ink-3 transition-colors select-none;
+  }
+  .thought-toggle:hover {
+    @apply bg-surface-2 text-ink-2;
+  }
+  .thought-body {
+    @apply max-h-64 overflow-y-auto border-t border-dashed border-line-2 px-2.5 py-2;
+    scrollbar-gutter: stable;
+  }
+
+  /* Model markdown: quiet type, tight rhythm, code that reads as code. */
+  .md {
+    @apply text-[13.5px] leading-[1.65] text-ink [overflow-wrap:anywhere];
+  }
+  .md > *:first-child {
+    @apply mt-0;
+  }
+  .md > *:last-child {
+    @apply mb-0;
+  }
+  .md p {
+    @apply my-2;
+  }
+  .md-compact {
+    @apply text-[12.5px] leading-relaxed text-ink-2;
+  }
+  .md h1,
+  .md h2,
+  .md h3,
+  .md h4 {
+    @apply mt-3 mb-1 font-semibold tracking-tight text-ink;
+  }
+  .md h1 {
+    @apply text-[15px];
+  }
+  .md h2 {
+    @apply text-[14px];
+  }
+  .md h3,
+  .md h4 {
+    @apply text-[13px];
+  }
+  .md ul,
+  .md ol {
+    @apply my-2 space-y-1 pl-5;
+  }
+  .md ul {
+    @apply list-disc;
+  }
+  .md ol {
+    @apply list-decimal;
+  }
+  .md li > p {
+    @apply my-0.5;
+  }
+  .md blockquote {
+    @apply my-2 border-l-2 border-line-2 pl-2.5 text-ink-2;
+  }
+  .md a {
+    @apply text-primary underline decoration-primary/40 underline-offset-2;
+  }
+  .md code {
+    @apply rounded bg-surface-3 px-1 py-px font-mono text-[0.86em] text-ink;
+  }
+  .md pre {
+    @apply my-2 overflow-x-auto rounded-lg border border-line bg-surface p-2.5;
+  }
+  .md pre code {
+    @apply bg-transparent p-0;
+  }
+  .md table {
+    @apply my-2 w-full border-collapse text-[12.5px];
+  }
+  .md th,
+  .md td {
+    @apply border border-line px-2 py-1 text-left;
+  }
+  .md th {
+    @apply bg-surface-2 font-semibold;
+  }
+  .md hr {
+    @apply my-3 border-line;
+  }
+  .md strong {
+    @apply font-semibold text-ink;
+  }
+
+  /* Entrance motion for everything that streams in. */
+  @keyframes rise {
+    from {
+      opacity: 0;
+      transform: translateY(10px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+  .rise {
+    animation: rise 0.35s cubic-bezier(0.2, 0.7, 0.3, 1) both;
+  }
+
+  @keyframes glow-pulse {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.35;
+    }
+  }
+  .live-dot {
+    animation: glow-pulse 1.6s ease-in-out infinite;
+  }
+
+  /* Three dots rising in turn, so a wait is visibly alive. */
+  .bouncing-dots {
+    @apply inline-flex items-end gap-[2px];
+    height: 0.65em;
+  }
+  .bouncing-dots i {
+    @apply block size-[3px] rounded-full bg-current opacity-60;
+    animation: dot-bounce 1.05s ease-in-out infinite;
+  }
+  .bouncing-dots i:nth-child(2) {
+    animation-delay: 0.14s;
+  }
+  .bouncing-dots i:nth-child(3) {
+    animation-delay: 0.28s;
+  }
+  @keyframes dot-bounce {
+    0%,
+    70%,
+    100% {
+      transform: translateY(0);
+      opacity: 0.35;
+    }
+    35% {
+      transform: translateY(-0.32em);
+      opacity: 1;
+    }
+  }
+
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+  .spinner {
+    @apply inline-block size-3.5 rounded-full border-2 border-line-2;
+    border-top-color: var(--primary);
+    animation: spin 0.8s linear infinite;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .rise,
+    .live-dot,
+    .spinner,
+    .bouncing-dots i {
+      animation: none;
+    }
+    .btn:hover:not(:disabled) {
+      transform: none;
+    }
+  }
+}
+
+@layer components {
+  /* Native controls are what make a dark UI look unfinished. Dress them. */
+  select.field {
+    appearance: none;
+    padding-right: 28px;
+    cursor: pointer;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%239aa0a6' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 10px center;
+  }
+  select.field:disabled {
+    cursor: not-allowed;
+  }
+  select.field option {
+    background: var(--surface-2);
+    color: var(--ink);
+  }
+
+  input[type="range"].field-range,
+  input[type="range"] {
+    -webkit-appearance: none;
+    appearance: none;
+    height: 4px;
+    border-radius: 999px;
+    background: var(--surface-3);
+    padding: 0;
+    margin: 8px 0 4px;
+    border: none;
+  }
+  input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 15px;
+    height: 15px;
+    border-radius: 50%;
+    background: var(--primary);
+    border: 2.5px solid var(--surface);
+    box-shadow: 0 0 0 1px var(--line-2), var(--shadow-1);
+    cursor: pointer;
+    transition: transform 0.12s ease;
+  }
+  input[type="range"]::-webkit-slider-thumb:hover {
+    transform: scale(1.15);
+  }
+  input[type="range"]::-moz-range-thumb {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: var(--primary);
+    border: 2.5px solid var(--surface);
+    cursor: pointer;
+  }
+  input[type="range"]::-moz-range-track {
+    height: 4px;
+    border-radius: 999px;
+    background: var(--surface-3);
+  }
+  input[type="range"]:disabled {
+    opacity: 0.35;
+  }
+  input[type="range"]:disabled::-webkit-slider-thumb {
+    cursor: not-allowed;
+  }
+
+  /* Numeric fields read cleaner without the OS stepper glued on. */
+  input[type="number"] {
+    -moz-appearance: textfield;
+    appearance: textfield;
+  }
+  input[type="number"]::-webkit-outer-spin-button,
+  input[type="number"]::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+  }
+}
