@@ -1,17 +1,45 @@
 <!doctype html>
-<html lang="en" data-theme="dark">
+<html lang="en" data-theme="sage-dark">
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <!-- Google Sans Flex carries the rounded axis that the reference design
-         leans on; the app still reads correctly if these never arrive. -->
-    <link
-      rel="stylesheet"
-      href="https://fonts.googleapis.com/css2?family=Google+Sans+Flex:opsz,slnt,wdth,wght,ROND@8..144,-10..0,25..150,100..1000,0..100&family=Google+Sans+Code:wght@400;500&display=swap"
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <meta name="theme-color" content="#0a1514" />
+    <link rel="apple-touch-icon" href="/icons/icon-192.png" />
+    <!-- viewport-fit covers the notch: layout adds safe-area padding itself.
+         interactive-widget keeps the composer above the Android keyboard
+         instead of letting it cover the input. -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content"
     />
+    <!--
+      Apply the saved theme before first paint. Without this the page renders
+      sage-dark for a frame and then jumps, because React only reads
+      localStorage after mount. Mirrors the legacy "dark"/"light" values onto the
+      themes that kept those colour sets.
+    -->
+    <script>
+      (function () {
+        try {
+          var saved = localStorage.getItem("council.theme");
+          var id =
+            saved === "dark"
+              ? "sage-dark"
+              : saved === "light"
+                ? "sage-light"
+                : saved;
+          if (id) document.documentElement.dataset.theme = id;
+        } catch (e) {
+          /* storage blocked; the default attribute stands */
+        }
+      })();
+    </script>
+    <!-- Self-hosted, not fetched: the faces live in `src/fonts.css` (files
+         under `public/fonts`), so first paint never waits on a third party
+         and the app reads correctly offline. The stack below is still the
+         fallback while they load (`font-display: swap`) and the whole story
+         if they never arrive. -->
     <title>Council</title>
   </head>
 

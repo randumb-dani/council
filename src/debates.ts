@@ -82,31 +82,81 @@ export function stripForSave(state: CouncilState): CouncilState {
 function read(): SavedDebate[] {
   try {
     const raw = window.localStorage.getItem(KEY);
-    if (!raw) return [];
-    const parsed: unknown = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
+    if (!raw) {
+      readCache = null;
+      return [];
+    }
+    // The library is re-read on every save, every library render, and every
+    // capacity check — a full parse plus per-speech/per-point validation each
+    // time, over up to 20 full debates. The raw string is the cache key: same
+    // bytes, same library, so repeated reads within one debate cost a string
+    // compare. A write from another tab changes the bytes and re-parses, so no
+    // tab can go stale. Callers must not mutate what comes back — `saveDebate`
+    // and `listDebates` both work on copies (see below).
+    if (readCache && readCache.raw === raw) return readCache.parsed;
+    const parsed = validate(raw);
+    readCache = { raw, parsed };
+    return parsed;
+  } catch {
+    // A corrupt or half-written store must not take the app down with it.
+    readCache = null;
+    return [];
+  }
+}
+
+/** The last parsed library, keyed by the exact bytes it was parsed from. */
+let readCache: { raw: string; parsed: SavedDebate[] } | null = null;
+
+function validate(raw: string): SavedDebate[] {
+  const parsed: unknown = JSON.parse(raw);
+  if (!Array.isArray(parsed)) return [];
     return parsed.filter(
       (d): d is SavedDebate => {
         if (!d || typeof d !== "object") return false;
         const s = d as SavedDebate;
         if (typeof s.id !== "string" || !s.state || typeof s.state !== "object") return false;
         const st = s.state as unknown as Record<string, unknown>;
-        // A half-written or corrupt record must not blank the whole window
-        // when the reader or exporter walks it.
-        return (
-          Array.isArray(st.points) &&
-          Array.isArray(st.speeches) &&
-          Array.isArray(st.delegates) &&
-          Array.isArray(st.polls) &&
-          typeof st.tallies === "object" &&
-          st.tallies !== null
-        );
+        // A half-written or corrupt record must not blank the whole window when the
+        // reader or exporter walks it. This check used to stop at the top level,
+        // while three separate places assume more than it verified: `HomeView` and
+        // `ReaderView` read `debate.summary.motion`, `Panels` reads `speech.actions`
+        // for every record, and `toMarkdown` reads `speech.reads` and `point.beats`.
+        // One entry missing any of those blanked the whole app — there is no error
+        // boundary — while reading as a perfectly good library.
+        if (!s.summary || typeof s.summary !== "object") return false;
+        const sum = s.summary as unknown as Record<string, unknown>;
+        if (typeof sum.motion !== "string") return false;
+        if (typeof sum.unfinished !== "boolean") return false;
+        if (typeof sum.rounds !== "number") return false;
+        if (
+          !(
+            Array.isArray(st.points) &&
+            Array.isArray(st.speeches) &&
+            Array.isArray(st.delegates) &&
+            Array.isArray(st.polls)
+          )
+        ) {
+          return false;
+        }
+        if (typeof st.tallies !== "object" || st.tallies === null) return false;
+        if (st.reads !== undefined && (typeof st.reads !== "object" || st.reads === null)) {
+          return false;
+        }
+        // Every speech needs the arrays the renderers index into.
+        for (const sp of st.speeches as unknown[]) {
+          if (!sp || typeof sp !== "object") return false;
+          const r = sp as Record<string, unknown>;
+          if (!Array.isArray(r.actions)) return false;
+        }
+        // And every point the ones the exporter walks.
+        for (const pt of st.points as unknown[]) {
+          if (!pt || typeof pt !== "object") return false;
+          const r = pt as Record<string, unknown>;
+          if (!Array.isArray(r.beats)) return false;
+        }
+        return true;
       },
     );
-  } catch {
-    // A corrupt or half-written store must not take the app down with it.
-    return [];
-  }
 }
 
 function write(all: SavedDebate[]): boolean {
@@ -119,7 +169,13 @@ function write(all: SavedDebate[]): boolean {
 }
 
 export function listDebates(): SavedDebate[] {
-  return read().sort((a, b) => b.savedAt - a.savedAt);
+  // A copy: `sort` works in place, and the array belongs to the read cache.
+  return [...read()].sort((a, b) => b.savedAt - a.savedAt);
+}
+
+/** How many debates the library holds, and how many it is willing to hold. */
+export function libraryCapacity(): { kept: number; max: number } {
+  return { kept: read().length, max: MAX_KEPT };
 }
 
 export function loadDebate(id: string): SavedDebate | null {
@@ -138,15 +194,36 @@ const labelOf = (state: CouncilState, id: string) =>
   state.delegates.find((d) => d.id === id)?.label ?? id;
 
 export function summarise(state: CouncilState): DebateSummary {
-  const byStatus = (s: string) => state.points.filter((p) => state.tallies[p.id]?.status === s);
+  // One pass, not four filters: this runs on every library save, and the
+  // points list only grows.
+  let carried = 0;
+  let fell = 0;
+  let stalemate = 0;
+  let withdrawn = 0;
+  for (const p of state.points) {
+    switch (state.tallies[p.id]?.status) {
+      case "carried":
+        carried += 1;
+        break;
+      case "fell":
+        fell += 1;
+        break;
+      case "stalemate":
+        stalemate += 1;
+        break;
+      case "withdrawn":
+        withdrawn += 1;
+        break;
+    }
+  }
   return {
     motion: state.motion,
     rounds: Math.max(state.round, state.verdict?.rounds ?? 0),
     roundsConcluded: state.verdict?.rounds ?? 0,
-    carried: byStatus("carried").length,
-    fell: byStatus("fell").length,
-    stalemate: byStatus("stalemate").length,
-    withdrawn: byStatus("withdrawn").length,
+    carried,
+    fell,
+    stalemate,
+    withdrawn,
     points: state.points.length,
     speeches: state.speeches.length,
     unfinished: !state.verdict,
@@ -186,15 +263,34 @@ export function saveDebate(state: CouncilState, id: string): boolean {
 
   // Out of room. Drop the oldest, and if that is not enough, shed thinking
   // from the oldest entries first — the speeches are what the debate *was*.
+  // Rebuilt, not mutated: `all` shares its entry objects with the read cache,
+  // so assigning into one would corrupt later reads of bytes that never
+  // changed.
   all = all.sort((a, b) => a.savedAt - b.savedAt).slice(-Math.max(1, MAX_KEPT >> 1));
   for (let i = 0; i < all.length - 1 && !write(all); i += 1) {
-    all.splice(0, 1);
-    all[0]!.state = { ...all[0]!.state, speeches: withoutReasoning(all[0]!.state.speeches) };
+    // Drop the oldest, then shed thinking from the new oldest. Rebuilt, not
+    // mutated (see above).
+    const [, ...rest] = all;
+    const next = rest[0]!;
+    all = [
+      { ...next, state: { ...next.state, speeches: withoutReasoning(next.state.speeches) } },
+      ...rest.slice(1),
+    ];
   }
   if (write(all)) return true;
 
-  all[0]!.state = { ...all[0]!.state, speeches: withoutReasoning(all[0]!.state.speeches) };
-  return write(all);
+  // Strip the debate being saved, not the oldest one. `all` is sorted oldest-first,
+  // so the last resort used to strip somebody else's record while the current
+  // debate — the one holding six 2.5 MB images — stayed too big to save.
+  const newest = all.find((d) => d.id === id);
+  if (!newest) return false;
+  return write(
+    all.map((d) =>
+      d.id === id
+        ? { ...d, state: { ...d.state, speeches: withoutReasoning(d.state.speeches) } }
+        : d,
+    ),
+  );
 }
 
 function withoutReasoning(speeches: CouncilState["speeches"]): CouncilState["speeches"] {

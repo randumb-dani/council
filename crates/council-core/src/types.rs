@@ -74,12 +74,115 @@ impl ReasoningWire {
     }
 }
 
+/// Which API a server speaks.
+///
+/// Not a capability description — the wire is the same for three of these, and
+/// what differs is where the address comes from and how reasoning effort is
+/// spelled. Selecting one fills in sensible defaults that remain editable,
+/// because a self-hosted proxy in front of any of them is a normal thing to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum Provider {
+    /// Anything speaking `/v1/chat/completions`: llama.cpp, vLLM, Ollama, LM
+    /// Studio, Unsloth, OpenAI itself. The original and the default.
+    ///
+    /// The wire names are spelled out rather than derived, because serde's
+    /// `camelCase` turns this into `openAiCompatible` and `DeepSeek` into
+    /// `deepSeek`, while the frontend uses the names the products are actually
+    /// written with. `camelCase` is right for `ReasoningWire` — whose variants are
+    /// single words — and wrong here, where every variant is a proper noun.
+    #[default]
+    #[serde(rename = "openaiCompatible")]
+    OpenAiCompatible,
+    /// Google's OpenAI-compatible surface.
+    #[serde(rename = "gemini")]
+    Gemini,
+    /// OpenAI-compatible; reasoning arrives as `reasoning_content`.
+    #[serde(rename = "deepseek")]
+    DeepSeek,
+    /// OpenAI-compatible, and fronts most other providers besides.
+    #[serde(rename = "openrouter")]
+    OpenRouter,
+    /// Anthropic’s Messages API. This is a separate wire protocol, not another
+    /// OpenAI-compatible base URL.
+    #[serde(rename = "anthropic")]
+    Anthropic,
+}
+
+impl Provider {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OpenAiCompatible => "OpenAI-compatible",
+            Self::Gemini => "Google Gemini",
+            Self::DeepSeek => "DeepSeek",
+            Self::OpenRouter => "OpenRouter",
+            Self::Anthropic => "Anthropic Claude",
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAiCompatible => "openaiCompatible",
+            Self::Gemini => "gemini",
+            Self::DeepSeek => "deepseek",
+            Self::OpenRouter => "openrouter",
+            Self::Anthropic => "anthropic",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "gemini" => Self::Gemini,
+            "deepseek" => Self::DeepSeek,
+            "openrouter" => Self::OpenRouter,
+            "anthropic" => Self::Anthropic,
+            _ => Self::OpenAiCompatible,
+        }
+    }
+
+    /// The documented base URL, which a user can still overwrite.
+    pub fn default_base_url(self) -> &'static str {
+        match self {
+            Self::OpenAiCompatible => "http://127.0.0.1:8888",
+            // Google's compatibility layer lives under a versioned prefix that
+            // is not `/v1`, which is why it needs stating rather than inferred.
+            Self::Gemini => "https://generativelanguage.googleapis.com/v1beta/openai",
+            Self::DeepSeek => "https://api.deepseek.com",
+            Self::OpenRouter => "https://openrouter.ai/api/v1",
+            Self::Anthropic => "https://api.anthropic.com",
+        }
+    }
+
+    /// How this provider names its reasoning level, if it has one.
+    ///
+    /// Gemini spells it `thinking_level` inside a `thinking_config` object and
+    /// its own names; the OpenAI-compatible default uses `reasoning_effort`.
+    pub fn reasoning_mechanism(self) -> ReasoningMechanism {
+        match self {
+            Self::Gemini => ReasoningMechanism::GeminiThinkingConfig,
+            _ => ReasoningMechanism::EffortField,
+        }
+    }
+}
+
+/// Where a reasoning level goes on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningMechanism {
+    /// `reasoning_effort` beside `temperature`, then the wire shape from
+    /// [`ReasoningWire`].
+    EffortField,
+    /// Gemini's `thinking_config: { thinking_level }`.
+    GeminiThinkingConfig,
+}
+
 /// An OpenAI-compatible chat-completions server.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct EndpointConfig {
     pub id: EndpointId,
     pub name: String,
+    /// Which API this server speaks. Defaults and hints, not a switch: every
+    /// value below still applies and can be overridden.
+    pub provider: Provider,
     /// Base URL such as `http://127.0.0.1:8000/v1`. A trailing `/chat/completions`
     /// is tolerated and normalised away.
     pub base_url: String,
@@ -180,6 +283,32 @@ impl EndpointConfig {
         }
     }
 
+    /// Anthropic Messages URLs. Unlike the OpenAI-compatible path, there is no
+    /// `/chat/completions` fallback: trying another provider's endpoint shape
+    /// would turn a wrong address into a misleading downstream error.
+    pub fn anthropic_messages_urls(&self) -> Vec<String> {
+        vec![Self::anthropic_path(self.base(), "/v1/messages", "/messages")]
+    }
+
+    /// Anthropic model-listing URLs, using the same path preservation rule as
+    /// message calls.
+    pub fn anthropic_models_urls(&self) -> Vec<String> {
+        vec![Self::anthropic_path(self.base(), "/v1/models", "/models")]
+    }
+
+    fn anthropic_path(base: String, versioned: &str, unversioned: &str) -> String {
+        let base = base.trim_end_matches('/').to_string();
+        if base.ends_with(versioned) {
+            base
+        } else if base.ends_with("/v1") {
+            format!("{base}{}", unversioned.trim_start_matches("/v1"))
+        } else if base.ends_with(unversioned) {
+            base
+        } else {
+            format!("{base}{versioned}")
+        }
+    }
+
     /// The primary URL, for callers that do not need the fallback.
     pub fn chat_completions_url(&self) -> String {
         self.chat_completions_urls()
@@ -210,6 +339,66 @@ pub struct DelegateConfig {
     /// Free-form persona / style instructions.
     pub persona: Option<String>,
     pub temperature: Option<f32>,
+    /// Taken by the operator rather than a model. The engine waits for this
+    /// seat's turn instead of calling an endpoint, so it needs no model and no
+    /// endpoint — only on arguing seats; judging and summarizing stay with the
+    /// models, and `validate` refuses anything else.
+    pub human: bool,
+}
+
+/// One operator answer to a parked turn: the speech, the thinking behind it,
+/// and the tool calls built with the action picker. Shaped exactly like a
+/// model reply so the turn pipeline downstream cannot tell them apart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HumanTurnSubmit {
+    pub text: String,
+    pub thinking: String,
+    pub calls: Vec<crate::tools::RawToolCall>,
+}
+
+/// One operator answer to a parked ballot, per kind. The variants carry what
+/// each ballot's own return type carries, so a submit maps onto it directly.
+///
+/// Internally tagged on `kind`, and the adjournment variant is `adjourn` to
+/// match the ballot kind it answers — one name per kind across the whole
+/// boundary, so a client never has to translate between two vocabularies.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum HumanBallot {
+    Poll {
+        choice: String,
+        reason: Option<String>,
+        confidence: Option<f64>,
+    },
+    Review {
+        reading: StalemateReading,
+        reason: Option<String>,
+        vote: Option<Verdict>,
+    },
+    Adjourn {
+        confirm: bool,
+        reason: Option<String>,
+    },
+    Extension {
+        grant: bool,
+        reason: Option<String>,
+    },
+}
+
+impl HumanBallot {
+    /// Which ballot this answer belongs to. Internal tagging erases the variant
+    /// name on the wire, so it is recoverable only here — which is what lets a
+    /// mismatched submit be refused by name rather than silently abstained.
+    pub fn kind(&self) -> crate::events::BallotKind {
+        use crate::events::BallotKind;
+        match self {
+            Self::Poll { .. } => BallotKind::Poll,
+            Self::Review { .. } => BallotKind::Review,
+            Self::Adjourn { .. } => BallotKind::Adjourn,
+            Self::Extension { .. } => BallotKind::Extension,
+        }
+    }
 }
 
 /// The fixed roles a council is built around. Labels are fixed alongside:
@@ -281,6 +470,13 @@ pub struct DebateConfig {
     /// The motion put to the council.
     pub motion: String,
     pub extra_instructions: Option<String>,
+    /// The record of an unfinished debate being resumed, handed to every delegate.
+    ///
+    /// Separate from `extra_instructions` so it cannot overwrite the operator's own
+    /// standing instructions: that field is saved with the rest of the setup, so a
+    /// resume writing into it meant the *next*, unrelated debate was still being
+    /// handed the previous one's transcript.
+    pub resume_record: Option<String>,
     pub endpoints: Vec<EndpointConfig>,
     pub delegates: Vec<DelegateConfig>,
     pub max_rounds: u32,
@@ -359,6 +555,7 @@ impl Default for DebateConfig {
         Self {
             motion: String::new(),
             extra_instructions: None,
+            resume_record: None,
             endpoints: Vec::new(),
             delegates: Vec::new(),
             max_rounds: 0,
@@ -902,6 +1099,71 @@ pub struct DebateVerdict {
 #[cfg(test)]
 mod default_tests {
     use super::*;
+
+    /// The provider names cross the Tauri boundary as strings, and the frontend
+    /// spells them the way the products are written. serde's `camelCase` would
+    /// turn `DeepSeek` into `deepSeek` and `OpenRouter` into `openRouter`, which
+    /// the browser never sends — and the failure is a rejected command with no
+    /// hint which field was wrong, so it is worth pinning here.
+    #[test]
+    fn provider_names_round_trip_the_way_the_frontend_spells_them() {
+        let spellings = [
+            (Provider::OpenAiCompatible, "openaiCompatible"),
+            (Provider::Gemini, "gemini"),
+            (Provider::DeepSeek, "deepseek"),
+            (Provider::OpenRouter, "openrouter"),
+            (Provider::Anthropic, "anthropic"),
+        ];
+        for (variant, wire) in spellings {
+            assert_eq!(variant.as_str(), wire, "as_str disagrees with serde");
+            assert_eq!(Provider::parse(wire), variant, "parse disagrees for {wire}");
+            // And through serde itself, which is what the bridge actually uses.
+            let json = serde_json::to_string(&variant).expect("serialises");
+            assert_eq!(json, format!("\"{wire}\""));
+            let back: Provider = serde_json::from_str(&json).expect("deserialises");
+            assert_eq!(back, variant);
+        }
+    }
+
+    #[test]
+    fn anthropic_routes_keep_their_own_versioned_paths() {
+        let endpoint = EndpointConfig {
+            provider: Provider::Anthropic,
+            base_url: Provider::Anthropic.default_base_url().into(),
+            ..EndpointConfig::default()
+        };
+        assert_eq!(
+            endpoint.anthropic_messages_urls(),
+            vec!["https://api.anthropic.com/v1/messages".to_string()]
+        );
+        assert_eq!(
+            endpoint.anthropic_models_urls(),
+            vec!["https://api.anthropic.com/v1/models".to_string()]
+        );
+
+        let proxy = EndpointConfig {
+            provider: Provider::Anthropic,
+            base_url: "https://proxy.example/anthropic".into(),
+            ..EndpointConfig::default()
+        };
+        assert_eq!(
+            proxy.anthropic_messages_urls(),
+            vec!["https://proxy.example/anthropic/v1/messages".to_string()]
+        );
+    }
+
+    /// A saved config from before providers existed has no `provider` field, and
+    /// every endpoint in it was OpenAI-compatible by construction — it was the
+    /// only wire the engine spoke.
+    #[test]
+    fn an_endpoint_without_a_provider_loads_as_openai_compatible() {
+        let wire: EndpointConfig = serde_json::from_str(
+            r#"{"id":"a","name":"Local","baseUrl":"http://127.0.0.1:8000/v1"}"#,
+        )
+        .expect("an endpoint saved before providers existed");
+        assert_eq!(wire.provider, Provider::OpenAiCompatible);
+        assert_eq!(Provider::default(), Provider::OpenAiCompatible);
+    }
 
     #[test]
     fn the_reading_budget_defaults_the_same_both_ways() {

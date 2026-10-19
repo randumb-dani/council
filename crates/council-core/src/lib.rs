@@ -4,6 +4,7 @@
 //! against them, and rate every one of them `win` / `lose` / `stalemate`.
 //! Nothing a model says decides anything; only the board does.
 
+pub mod anthropic;
 pub mod client;
 pub mod decide;
 pub mod engine;
@@ -13,6 +14,10 @@ pub mod tools;
 pub mod types;
 pub mod web;
 
+pub use anthropic::{
+    list_anthropic_models, AnthropicBackend, ProviderBackend, ANTHROPIC_DEFAULT_MAX_TOKENS,
+    ANTHROPIC_VERSION,
+};
 pub use client::{
     client_for, list_models, ChatBackend, ChatMessage, ChatRequest, ChatResponse, HttpBackend, LlmError,
 };

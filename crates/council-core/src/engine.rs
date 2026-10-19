@@ -11,7 +11,7 @@ use futures_util::FutureExt;
 
 use crate::client::{ChatBackend, ChatChunk, ChatMessage, ChatRequest, ChatResponse, LlmError};
 use crate::decide::{ClassifyRequest, Decision, DecisionBackend, JevBackend};
-use crate::events::{DelegateBrief, EngineEvent, NoticeTone};
+use crate::events::{BallotKind, DelegateBrief, EngineEvent, NoticeTone};
 use crate::prompt;
 use crate::tools::{self, Action, RawToolCall};
 use crate::types::*;
@@ -77,6 +77,14 @@ struct Board {
     /// against five decisively carried ones. The seat that has read every round
     /// can, and when it speaks the ending says so in its own words.
     settled_by: Option<(DelegateId, String)>,
+    /// Bumped after every points mutation; keys the prompt caches below.
+    /// Delegates and config are fixed at convene time, so the points version
+    /// (plus the record length for the context tail) decides freshness.
+    points_version: u64,
+    /// `prompt::board_snapshot` for `points_version`.
+    snapshot_cache: Option<(u64, String)>,
+    /// Full ballot context for `(points_version, record.len())`.
+    ballot_cache: Option<(u64, usize, String)>,
 }
 
 impl Board {
@@ -106,6 +114,9 @@ impl Board {
             open_poll: None,
             extra_granted: 0,
             settled_by: None,
+            points_version: 0,
+            snapshot_cache: None,
+            ballot_cache: None,
         }
     }
 
@@ -292,6 +303,83 @@ pub struct Engine<B: ChatBackend> {
     /// usage request is dropped for them up front, so every turn on such a
     /// server does not pay a 400 plus a retry — and a notice — forever.
     usage_unsupported: Mutex<std::collections::BTreeSet<String>>,
+    /// A human seat's turn waiting on the operator's submit, if any. Set when
+    /// the turn parks, cleared when the answer is taken or the turn is
+    /// skipped — so a submit for any other turn is refused as stale.
+    turn_pending: Mutex<Option<HumanTurnPending>>,
+    /// The operator's submitted turn. Validated at submit time, taken exactly
+    /// once by the parked turn.
+    turn_answer: Mutex<Option<HumanTurnAnswer>>,
+    /// Wakes a parked human turn when the operator submits — or abandons it
+    /// when the turn is skipped. Stop wakes it through the skip hatch, like
+    /// every other wait in this engine.
+    turn_notify: tokio::sync::Notify,
+    /// A human seat's ballot waiting on the operator's answer, if any. Same
+    /// take-once discipline as the turn slots.
+    ballot_pending: Mutex<Option<HumanBallotPending>>,
+    /// The operator's submitted ballot, validated at submit time.
+    ballot_answer: Mutex<Option<HumanBallot>>,
+    /// Wakes a parked human ballot on submit; skips and stops go through the
+    /// same hatch as turns.
+    ballot_notify: tokio::sync::Notify,
+}
+
+/// A human turn parked on the operator: who owes the move, which turn of the
+/// debate it is, and the question the operator answers.
+#[derive(Debug, Clone)]
+struct HumanTurnPending {
+    delegate: String,
+    turn: TurnId,
+    round: u32,
+}
+
+/// A submitted human turn, validated and waiting to be taken.
+#[derive(Debug, Clone)]
+struct HumanTurnAnswer {
+    text: String,
+    thinking: String,
+    calls: Vec<RawToolCall>,
+}
+
+/// A human ballot parked on the operator. `question` and `options` are what
+/// the prompt shows; `point_id` rides along for reviews, where the question
+/// is about a point rather than free-standing.
+#[derive(Debug, Clone)]
+struct HumanBallotPending {
+    delegate: String,
+    kind: BallotKind,
+    question: String,
+    options: Vec<String>,
+    point_id: Option<u32>,
+}
+
+/// What the operator is being asked, as the snapshot carries it. Tag-shaped so
+/// a client can tell a turn from a ballot without string matching, and so a
+/// debate parked on a prompt is resumable after a reload.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum PendingPrompt {
+    Turn {
+        delegate: String,
+        turn: TurnId,
+        round: u32,
+    },
+    Ballot {
+        delegate: String,
+        /// Which ballot this is. Under an internal tag a variant cannot own a
+        /// field called `kind`, so the ballot kind rides as `ballot` — the tag
+        /// already says "this is a ballot".
+        ballot: BallotKind,
+        question: String,
+        options: Vec<String>,
+        point_id: Option<u32>,
+    },
+}
+
+/// A delegate's display name, for the prompts the operator reads. Its own
+/// method, used where the board lock must not already be held.
+fn opener_label_of<B: ChatBackend>(engine: &Engine<B>, id: &str) -> String {
+    engine.label_of_id(id)
 }
 
 /// How long a summarizer proposal may go unanswered before it is declined.
@@ -352,18 +440,77 @@ const HISTORY_HEAD: usize = 400;
 const HISTORY_TAIL: usize = 600;
 
 fn clip_for_memory(text: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
     let keep = HISTORY_HEAD + HISTORY_TAIL;
-    if chars.len() <= keep + 40 {
+    if text.len() <= keep + 40 {
+        // At most `keep + 40` bytes, so at most that many chars: the
+        // character-count fast path below cannot trigger either.
         return text.to_string();
     }
-    let head: String = chars[..HISTORY_HEAD].iter().collect();
-    let tail: String = chars[chars.len() - HISTORY_TAIL..].iter().collect();
+    // One pass over the char boundaries, not a `Vec<char>` plus two slices.
+    // Each entry is the byte index where one char starts, so every slice
+    // below lands on a boundary by construction.
+    let mut bounds: Vec<usize> = Vec::new();
+    for (idx, _) in text.char_indices() {
+        bounds.push(idx);
+    }
+    let nchars = bounds.len();
+    if nchars <= keep + 40 {
+        return text.to_string();
+    }
+    let head = &text[..bounds[HISTORY_HEAD]];
+    let tail = &text[bounds[nchars - HISTORY_TAIL]..];
     format!(
         "{head}\n[...{} characters of this turn are in the transcript but not \
          here...]\n{tail}",
-        chars.len() - keep
+        nchars - keep
     )
+}
+
+/// Drop already-delivered image payloads from a seat's stored history.
+///
+/// Only `images` is touched: roles, text and order are byte-identical, so the
+/// next request renders the same messages minus the data URLs. Called once the
+/// seat's turn is accepted (see `finish_turn`); the in-flight request was
+/// built before, so the first send is unaffected.
+fn strip_sent_images(history: &mut [ChatMessage]) {
+    for m in history.iter_mut() {
+        if !m.images.is_empty() {
+            m.images.clear();
+        }
+    }
+}
+
+/// Keep the tail of `s` when it holds more than `budget` chars.
+///
+/// Byte-identical to the `while s.chars().count() > budget { nth(...) }` loops
+/// this replaces: over budget drops the first `count - budget + 1` chars, which
+/// the old loop did in a single pass of two full scans (a count, then an
+/// `nth`). This does one partial scan — a byte-length pre-check first, then a
+/// single walk that stops at the cut — and never splits a char, because the
+/// cut comes from `char_indices`.
+fn tail_clip(mut s: String, budget: usize) -> String {
+    if s.len() <= budget {
+        // At most `budget` bytes, so at most `budget` chars: already fits.
+        return s;
+    }
+    let total = s.chars().count();
+    if total <= budget {
+        return s;
+    }
+    // The old loop cut at char number `total - budget + 1` (0-indexed), i.e.
+    // it kept the last `budget - 1` chars; keep that exact cut. `nth` stops at
+    // the cut instead of scanning to the end, and `drain` moves the tail down
+    // in place rather than allocating a second string.
+    let drop = total - budget + 1;
+    match s.char_indices().nth(drop).map(|(i, _)| i) {
+        Some(at) => {
+            s.drain(..at);
+            s
+        }
+        // Degenerate (cannot happen while `budget >= 1`): the old code cut at
+        // 0 and looped forever; return the input unchanged instead.
+        None => s,
+    }
 }
 
 /// Drop every per-turn brief except the newest.
@@ -377,6 +524,7 @@ fn clip_for_memory(text: &str) -> String {
 /// board it could already see.
 ///
 /// The seat's own words are all kept. Only the redundant state goes.
+/// Drop every superseded turn brief, keeping the newest one.
 fn prune_superseded_briefs(history: &mut Vec<ChatMessage>) {
     let Some(newest) = history.iter().rposition(prompt::is_turn_brief) else {
         return;
@@ -391,6 +539,65 @@ fn prune_superseded_briefs(history: &mut Vec<ChatMessage>) {
     *history = kept;
 }
 
+/// Make a history's *assistant* messages safe to put in front of a chat
+/// template.
+///
+/// This is the loop, and it starts on the third turn.
+///
+/// `prune_superseded_briefs` removes the user turn that asked a question, and
+/// `finish_turn` pushes the delegate's own reply after it. So from the third
+/// turn the history is
+///
+/// ```text
+/// system, user, assistant, assistant, user
+/// ```
+///
+/// — two assistants in a row, which no chat template is written for. Most local
+/// servers render that with a Jinja template trained on strict alternation and
+/// hand the model a prompt it has never seen; the usual result is degeneration
+/// into repetition. It is worst when the model made tool calls and wrote no
+/// prose, because then the two consecutive assistant messages are both *empty*:
+/// the model is shown that it said nothing, twice, and invited to fill the void.
+///
+/// Merging the run into one message fixes the shape, and joining with a blank
+/// line keeps both replies readable. Empty ones are dropped first — they carry
+/// nothing for the next turn, and leaving them in is what makes the pair
+/// degenerate rather than merely odd.
+///
+/// Deliberately scoped to assistant messages. Merging the opening message into
+/// the first brief would also alternate the roles, but it grows the standing
+/// head with a whole board snapshot, and the head is exactly what compaction is
+/// forbidden from touching — so that "fix" trades a loop for a prompt that can
+/// no longer be shortened. Consecutive user messages are left as they were:
+/// they appear once, on the opening turn, and the templates that choke on them
+/// were never the ones reporting the loop.
+fn normalize_history(history: &mut Vec<ChatMessage>) {
+    history.retain(|m| m.role != "assistant" || !m.content.trim().is_empty());
+    let mut out: Vec<ChatMessage> = Vec::with_capacity(history.len());
+    for m in history.drain(..) {
+        match out.last_mut() {
+            Some(prev) if prev.role == "assistant" && m.role == "assistant" => {
+                // Remember what is being folded in, so compaction can still give up
+                // these turns individually if the prompt has to be shortened later.
+                // Without this the seat's four replies read as one message, and
+                // `compact_history`'s "keep the newest N turns" rule protects all
+                // four at once — which is how a prompt that genuinely does not fit
+                // ends up with "nothing left to shorten".
+                if prev.merged.is_empty() {
+                    prev.merged.push(std::mem::take(&mut prev.content));
+                }
+                prev.merged.push(m.content);
+                // `prev.merged` is non-empty exactly when a fold has happened, and
+                // `content` is its join. Every part is non-empty — the empty ones
+                // were dropped above — so a blank line always separates them.
+                prev.content = prev.merged.join("\n\n");
+            }
+            _ => out.push(m),
+        }
+    }
+    *history = out;
+}
+
 /// How many times a turn may go back to the model after a lookup.
 ///
 /// A second read almost always means a search followed by the article it found,
@@ -402,6 +609,187 @@ const CONTINUATIONS: usize = 2;
 /// from the turn and the seat is told how many it is missing, rather than being
 /// left to believe it has seen everything.
 const RECORD_TAIL: usize = 40;
+
+/// How many of a delegate's own recent turns survive compaction.
+///
+/// The newest turns are the ones it is mid-argument in; the oldest are where it
+/// set out its case, which the round summaries carry instead.
+const COMPACT_KEEP_TURNS: usize = 2;
+
+/// What compaction dropped, so it can be announced rather than suffered quietly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Compaction {
+    /// How many of the delegate's own messages were replaced.
+    pub dropped_messages: usize,
+    /// How many round summaries were folded in to stand in for them.
+    pub summaries_used: usize,
+    /// True when no summary covered the dropped span and the head/tail clip
+    /// stood in — which is the round-one case, where nothing has been summarised
+    /// yet because summarising happens at the end of a round.
+    pub clipped_without_summaries: bool,
+}
+
+/// Shorten one delegate's history until the model will accept it.
+///
+/// This is the last thing tried, after the server has already refused the same
+/// prompt several times, so it is deliberately lossy and deliberately loud: the
+/// transcript and the export keep everything, and the delegate is told in its
+/// next prompt that it is working from a summary rather than the transcript.
+///
+/// The order of sacrifice is fixed and states what it gives up:
+///
+/// 1. Superseded board briefs first — `prune_superseded_briefs` already does
+///    this every turn, so there are none left, but calling it is free and keeps
+///    the invariant local.
+/// 2. Then whole rounds of the delegate's own speeches, oldest first, replaced by
+///    the round summaries the Summarizer already wrote to the record. Those are
+///    the same summaries the delegate has read in passing through its
+///    `RECORD_TAIL` window; promoting them to a standing preamble is the whole
+///    idea, and it means compaction never has to invent anything.
+/// 3. If no summary covers the span — round one, where nothing has been
+///    summarised yet — fall back to `clip_for_memory`'s head/tail clip on each
+///    remaining message rather than dropping them. A delegate with a clipped
+///    early speech argues worse; a delegate with no early speech forgets its own
+///    case entirely.
+///
+/// Returns `None` when there is nothing left to give up, which the caller treats
+/// as "give up on the turn" rather than resending an identical prompt.
+fn compact_history(
+    history: &[ChatMessage],
+    summaries: &[String],
+) -> Option<(Vec<ChatMessage>, Compaction)> {
+    if history.len() <= 3 {
+        // System, opening, and the newest brief. Nothing to trade.
+        return None;
+    }
+    let mut kept = history.to_vec();
+    prune_superseded_briefs(&mut kept);
+
+    // Re-expand the runs `normalize_history` folded. Compaction gives up *turns*,
+    // oldest first, and a folded run of four replies is four turns wearing one
+    // hat — left folded, the "keep the newest N turns" rule below protects all
+    // four at once and a prompt that genuinely does not fit is reported as having
+    // nothing to give. The output is re-folded on the way out, so the template
+    // still sees the alternating shape it needs.
+    let kept: Vec<ChatMessage> = kept
+        .into_iter()
+        .flat_map(|m| {
+            if m.merged.is_empty() {
+                return vec![m];
+            }
+            m.merged
+                .into_iter()
+                .map(|part| ChatMessage {
+                    role: "assistant".into(),
+                    content: part,
+                    images: Vec::new(),
+                    merged: Vec::new(),
+                })
+                .collect()
+        })
+        .collect();
+
+    // Oldest first, keeping the system prompt, the opening message and the
+    // newest brief, which is the shape the prompt is assembled around.
+    let newest_brief = kept.iter().rposition(prompt::is_turn_brief).unwrap_or(kept.len());
+    // Index 0 is the system prompt and index 1 is the opening message, which is the
+    // only message carrying the attached images — both are load-bearing and
+    // neither is the delegate's own speech, so neither may be traded. Excluding
+    // them by position is deliberate: there is no marker on either, and a
+    // message that happens to have no images is still the opening message.
+    let mut droppable: Vec<usize> = kept
+        .iter()
+        .enumerate()
+        .filter(|(i, m)| *i > 1 && *i != newest_brief && !prompt::is_turn_brief(m))
+        .map(|(i, _)| i)
+        .collect();
+    // Never take the seat's own most recent turns: that is the argument it is
+    // in the middle of.
+    let budget = droppable.len().saturating_sub(COMPACT_KEEP_TURNS);
+    if budget == 0 {
+        return None;
+    }
+    droppable.truncate(budget);
+    let dropped_messages = droppable.len();
+
+    let removed: std::collections::HashSet<usize> = droppable.iter().copied().collect();
+    // Survivors keep their source index, so the clip below knows exactly which
+    // three are load-bearing. Tracking positions rather than comparing content:
+    // two different messages can carry the same text, and a survivor that happened
+    // to match a dropped one used to skip clipping entirely.
+    let mut out: Vec<ChatMessage> = Vec::new();
+    for (i, m) in kept.iter().enumerate() {
+        if removed.contains(&i) {
+            continue;
+        }
+        out.push(if i == 0 || i == 1 || i == newest_brief {
+            m.clone()
+        } else {
+            ChatMessage {
+                content: clip_for_memory(&m.content),
+                merged: Vec::new(),
+                ..m.clone()
+            }
+        });
+    }
+
+    let summaries_used = summaries.len().min(dropped_messages);
+    if summaries_used > 0 {
+        // Put the stand-in where the dropped speeches were: immediately before
+        // the newest brief, which is where the seat reads the "since your last
+        // turn" floor.
+        let standing = format!(
+            "[Earlier in this debate your own speeches were replaced to fit the \
+             model's context window. The record carries the full transcript; this \
+             is what the Summarizer recorded of rounds up to here.]\n{}",
+            summaries
+                .iter()
+                .take(summaries_used)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let at = out.iter().rposition(prompt::is_turn_brief).unwrap_or(out.len());
+        out.insert(at, ChatMessage::user(standing));
+    }
+
+    // Dropping the oldest replies leaves the ones before them adjacent again, so the
+    // template shape has to be restored before this goes back on the board. Same
+    // function, same rules — this is not a second, weaker normaliser.
+    normalize_history(&mut out);
+
+    Some((
+        out,
+        Compaction {
+            dropped_messages,
+            summaries_used,
+            clipped_without_summaries: summaries_used == 0,
+        },
+    ))
+}
+
+/// The round summaries in the record, oldest first, for use as compaction
+/// stand-ins.
+///
+/// `run_intermission` writes each one as `"ROUND {round} SUMMARY: …"`, which is
+/// the only structured marker in an otherwise flat log.
+fn round_summaries(b: &Board) -> Vec<String> {
+    let mut seen_rounds = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for e in &b.record {
+        let Some(rest) = e.text.strip_prefix("ROUND ") else {
+            continue;
+        };
+        let Some((n, text)) = rest.split_once(" SUMMARY: ") else {
+            continue;
+        };
+        // One per round: a long intermission can write more than once.
+        if n.parse::<u32>().is_ok() && text.trim().is_empty() == false && seen_rounds.insert(n) {
+            out.push(format!("R{n}: {}", text.trim()));
+        }
+    }
+    out
+}
 
 /// What came of a request for more rounds.
 ///
@@ -445,6 +833,12 @@ impl<B: ChatBackend> Engine<B> {
             extension_notify: tokio::sync::Notify::new(),
             web: Mutex::new(None),
             usage_unsupported: Mutex::new(std::collections::BTreeSet::new()),
+            turn_pending: Mutex::new(None),
+            turn_answer: Mutex::new(None),
+            turn_notify: tokio::sync::Notify::new(),
+            ballot_pending: Mutex::new(None),
+            ballot_answer: Mutex::new(None),
+            ballot_notify: tokio::sync::Notify::new(),
         }
     }
 
@@ -859,6 +1253,12 @@ impl<B: ChatBackend> Engine<B> {
             extension_notify: tokio::sync::Notify::new(),
             web: Mutex::new(None),
             usage_unsupported: Mutex::new(std::collections::BTreeSet::new()),
+            turn_pending: Mutex::new(None),
+            turn_answer: Mutex::new(None),
+            turn_notify: tokio::sync::Notify::new(),
+            ballot_pending: Mutex::new(None),
+            ballot_answer: Mutex::new(None),
+            ballot_notify: tokio::sync::Notify::new(),
         }
     }
 
@@ -900,6 +1300,37 @@ impl<B: ChatBackend> Engine<B> {
 
     pub fn turn_in_flight(&self) -> bool {
         self.skip_tx.lock().expect("skip").is_some()
+    }
+
+    /// Is this seat taken by the operator? Read from the board rather than
+    /// taken as an argument, because every caller is deciding what to do with
+    /// a seat and the answer must be the board's current one.
+    fn is_human(&self, id: &str) -> bool {
+        let b = self.board.lock().expect("board");
+        b.delegate(id).is_some_and(|d| d.human && d.seat_role.argues())
+    }
+
+    /// What is the operator being asked right now, if anything.
+    ///
+    /// Carried in the snapshot so a reload or a return from the library lands
+    /// on an unanswered prompt instead of an empty chamber with a debate
+    /// still running behind it.
+    pub fn pending_prompt(&self) -> Option<PendingPrompt> {
+        if let Some(p) = self.turn_pending.lock().expect("turn").clone() {
+            return Some(PendingPrompt::Turn {
+                delegate: p.delegate,
+                turn: p.turn,
+                round: p.round,
+            });
+        }
+        let b = self.ballot_pending.lock().expect("ballot").clone();
+        b.map(|p| PendingPrompt::Ballot {
+            delegate: p.delegate,
+            ballot: p.kind,
+            question: p.question,
+            options: p.options,
+            point_id: p.point_id,
+        })
     }
 
     pub fn is_running(&self) -> bool {
@@ -945,7 +1376,279 @@ impl<B: ChatBackend> Engine<B> {
         b.note("operator", round, format!("OPERATOR NOTE: {}", text.trim()));
     }
 
+    // -- the human seat ------------------------------------------------------
+
+    /// Park on the operator until they submit, skip, or stop.
+    ///
+    /// No deadline: the same trade an unanswered extension proposal makes —
+    /// an unattended window must not silently decide the debate, and Stop is
+    /// always there. Skip returns `Skipped` so a taken turn behaves exactly
+    /// like a skipped model turn: rolled back, announced, and the round moves
+    /// on without it.
+    async fn await_human_turn(
+        &self,
+        id: &str,
+        round: u32,
+        turn: TurnId,
+        brief: String,
+    ) -> Outcome<ChatResponse> {
+        let label = self.label_of_id(id);
+        *self.turn_answer.lock().expect("turn") = None;
+        // Registered *before* the pending state is published and `YourTurn` is
+        // emitted. It was registered after, and in that window `self.skip_tx` was
+        // `None` (the previous request had cleared it), so a Stop arriving in it
+        // sent into a channel nobody was holding — the operator pressed Stop and
+        // the debate carried on.
+        let (skip_tx, mut skip_rx) = tokio::sync::oneshot::channel();
+        *self.skip_tx.lock().expect("skip") = Some(skip_tx);
+        *self.turn_pending.lock().expect("turn") = Some(HumanTurnPending {
+            delegate: id.to_string(),
+            turn,
+            round,
+        });
+        self.sink.emit(EngineEvent::YourTurn {
+            turn,
+            delegate: id.to_string(),
+            label: label.clone(),
+            round,
+            brief,
+        });
+
+        let answered = loop {
+            // Polled rather than purely notified: `notify_waiters` stores no
+            // permit, so a submit landing between the check and the
+            // registration would otherwise wait for a turn that never comes.
+            //
+            // Cancellation is *not* an answer. It used to break `true` here, which
+            // meant a Stop while parked fell through to the empty-response default
+            // below: the seat took a full turn saying nothing, the transcript
+            // recorded "(empty turn — nothing said, nothing done)", and the debate
+            // carried a turn the operator never gave. Stop means skip, exactly as
+            // it does for a model seat in flight.
+            if self.turn_answer.lock().expect("turn").is_some() {
+                break true;
+            }
+            if self.cancelled() {
+                break false;
+            }
+            tokio::select! {
+                _ = &mut skip_rx => break false,
+                _ = self.turn_notify.notified() => {}
+                _ = tokio::time::sleep(Duration::from_millis(120)) => {}
+            }
+        };
+        *self.skip_tx.lock().expect("skip") = None;
+        *self.turn_pending.lock().expect("turn") = None;
+
+        if !answered {
+            return Outcome::Skipped;
+        }
+        let answer = self
+            .turn_answer
+            .lock()
+            .expect("turn")
+            .take()
+            .unwrap_or(HumanTurnAnswer {
+                text: String::new(),
+                thinking: String::new(),
+                calls: Vec::new(),
+            });
+        // One turn's content, clipped the way a model's is: an unbounded paste
+        // would then ride in every later prompt and history.
+        Outcome::Done(Ok(ChatResponse {
+            content: answer.text,
+            reasoning: answer.thinking,
+            tool_calls: answer.calls,
+            ..Default::default()
+        }))
+    }
+
+    /// Answer a parked human turn.
+    ///
+    /// Validated here, not at submit: a mistyped action must be fixable, and a
+    /// model's malformed call is reported and skipped while a human's is
+    /// refused and re-prompted. The same `parse_action` runs either way, so
+    /// there is one dialect of validation rather than two.
+    pub fn submit_turn(&self, submit: HumanTurnSubmit) -> Result<(), String> {
+        let waiting = self.turn_pending.lock().expect("turn").is_some();
+        if !waiting {
+            return Err("no turn is waiting for you".into());
+        }
+        if submit.text.trim().is_empty()
+            && submit.thinking.trim().is_empty()
+            && submit.calls.is_empty()
+        {
+            return Err("say something or make a move — an empty turn is not a turn".into());
+        }
+        let mut known: Vec<u32> = {
+            let b = self.board.lock().expect("board");
+            b.points.iter().map(|p| p.id).collect()
+        };
+        // A claim raised in this same submit is referred to as the next point
+        // number, so raising one and voting on it in one turn — which is what a
+        // delegate does, and the most natural turn an operator can take — is not
+        // refused for naming a point the board has not numbered yet.
+        //
+        // `make_point` is excluded from the reference check below: its `point`
+        // argument is an accepted *alias for the claim text*, not an id, so
+        // reading a number there as a reference would be wrong.
+        for call in &submit.calls {
+            if matches!(call.name.as_str(), "make_point" | "raise_point" | "point") {
+                known.push(known.iter().copied().max().unwrap_or(0) + 1);
+            }
+        }
+        known.sort_unstable();
+        known.dedup();
+        for call in &submit.calls {
+            if matches!(call.name.as_str(), "make_point" | "raise_point" | "point") {
+                continue;
+            }
+            let Some(id) = call.arguments.get("point").and_then(|v| v.as_u64()) else {
+                continue;
+            };
+            if !known.contains(&(id as u32)) {
+                return Err(format!(
+                    "there is no point {id} on the board yet — the points so far are: {}",
+                    known
+                        .iter()
+                        .map(|p| format!("P{p}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
+        for call in &submit.calls {
+            tools::parse_action(call).map_err(|why| format!("{}: {why}", call.name))?;
+        }
+        *self.turn_answer.lock().expect("turn") = Some(HumanTurnAnswer {
+            text: submit.text,
+            thinking: submit.thinking,
+            calls: submit.calls,
+        });
+        // notify_waiters stores no permit, so a submit landing between the
+        // parked turn's check and its registration would wait for the next
+        // turn's submit. The waiter polls the slot, so nothing is lost either
+        // way — but a store-and-wait is not a deadlock, and the answer is taken
+        // exactly once by the turn that owns it.
+        self.turn_notify.notify_waiters();
+        self.turn_notify.notify_one();
+        Ok(())
+    }
+
+    /// Answer a parked human ballot.
+    pub fn submit_ballot(&self, ballot: HumanBallot) -> Result<(), String> {
+        if !ballot.kind().can_ask() {
+            // Belt and braces: every variant is a question the council asks, so
+            // this is currently unreachable, and kept so adding a variant
+            // cannot silently make it answerable.
+            return Err("that ballot is not something the council asks".into());
+        }
+        let pending = self.ballot_pending.lock().expect("ballot").clone();
+        let Some(pending) = pending else {
+            return Err("no ballot is waiting for you".into());
+        };
+        // The answer is checked against the options the prompt advertised, so a
+        // stale client cannot vote on a poll it never saw.
+        match (pending.kind, &ballot) {
+            (BallotKind::Poll, HumanBallot::Poll { choice, .. }) => {
+                if !pending.options.iter().any(|o| o == choice) {
+                    return Err(format!(
+                        "`{choice}` is not one of this poll's options: {}",
+                        pending.options.join(", ")
+                    ));
+                }
+            }
+            (BallotKind::Review, HumanBallot::Review { reading, .. }) => {
+                let shown = pending.options.iter().any(|o| o == reading.as_str());
+                if !shown {
+                    return Err(format!(
+                        "`{}` is not one of this review's readings: {}",
+                        reading.as_str(),
+                        pending.options.join(", ")
+                    ));
+                }
+            }
+            // The variant that answers the pending ballot must match its kind.
+            // A mismatched submit is refused rather than quietly ignored, so a
+            // client that sends the wrong shape gets told instead of abstaining.
+            (BallotKind::Adjourn, HumanBallot::Adjourn { .. }) => {}
+            (BallotKind::Extension, HumanBallot::Extension { .. }) => {}
+            (k, _) => {
+                return Err(format!(
+                    "that answer is for a {} ballot, but the council is waiting on a {} one",
+                    ballot.kind().as_words(),
+                    k.as_words()
+                ))
+            }
+        }
+        *self.ballot_answer.lock().expect("ballot") = Some(ballot);
+        self.ballot_notify.notify_waiters();
+        self.ballot_notify.notify_one();
+        Ok(())
+    }
+
+    /// Park a human seat on a ballot until the operator answers, skips, or stops.
+    ///
+    /// `None` is the abstention every other ballot already treats as "out" —
+    /// not a vote against, and not recorded.
+    async fn await_human_ballot(
+        &self,
+        delegate: &str,
+        kind: BallotKind,
+        question: String,
+        options: Vec<String>,
+        point_id: Option<u32>,
+    ) -> Option<HumanBallot> {
+        *self.ballot_answer.lock().expect("ballot") = None;
+        // Registered before the pending state is published, for the same reason as
+        // in `await_human_turn`: a Stop in the window between publishing and
+        // registering is a Stop nobody hears.
+        let (skip_tx, mut skip_rx) = tokio::sync::oneshot::channel();
+        *self.skip_tx.lock().expect("skip") = Some(skip_tx);
+        *self.ballot_pending.lock().expect("ballot") = Some(HumanBallotPending {
+            delegate: delegate.to_string(),
+            kind,
+            question: question.clone(),
+            options: options.clone(),
+            point_id,
+        });
+        self.sink.emit(EngineEvent::BallotAsked {
+            delegate: delegate.to_string(),
+            kind,
+            question,
+            options,
+            point_id,
+        });
+        let answered = loop {
+            // As in `await_human_turn`: cancellation is a skip, not an answer. It
+            // used to break `true`, and the `None` this then returned is the
+            // *abstention* — so a Stop recorded as "no seat answered — nothing was
+            // decided", closed the poll anyway, and showed an adjournment ballot as
+            // declined. Stopping is not declining.
+            if self.ballot_answer.lock().expect("ballot").is_some() {
+                break true;
+            }
+            if self.cancelled() {
+                break false;
+            }
+            tokio::select! {
+                _ = &mut skip_rx => break false,
+                _ = self.ballot_notify.notified() => {}
+                _ = tokio::time::sleep(Duration::from_millis(120)) => {}
+            }
+        };
+        *self.skip_tx.lock().expect("skip") = None;
+        *self.ballot_pending.lock().expect("ballot") = None;
+        if !answered {
+            return None;
+        }
+        self.ballot_answer.lock().expect("ballot").take()
+    }
+
     pub fn snapshot(&self) -> Snapshot {
+        // Read before the board: `pending_prompt` takes the same lock twice,
+        // and the board is held for the rest of this function.
+        let pending = self.pending_prompt();
         let b = self.board.lock().expect("board");
         // Finished means the engine is no longer running a debate. The old
         // `adjourn.is_some()` check only covered adjourn endings, so a
@@ -967,6 +1670,7 @@ impl<B: ChatBackend> Engine<B> {
             polls: b.polls.clone(),
             speeches: b.speeches.clone(),
             finished,
+            pending,
         }
     }
 
@@ -1285,10 +1989,12 @@ impl<B: ChatBackend> Engine<B> {
         // times is five lost turns and a slower, less informative error.
         const RETRIES: u32 = 2;
         let mut attempt = 0u32;
+        let mut current = req.clone();
+        let mut usage_retried = false;
         let outcome = loop {
             let began = std::time::Instant::now();
             let mut r = tokio::select! {
-                r = self.backend.chat(req, on_chunk) => Outcome::Done(r),
+                r = self.backend.chat(&current, on_chunk) => Outcome::Done(r),
                 _ = &mut skip_rx => Outcome::Skipped,
             };
             let used = began.elapsed().as_secs_f64();
@@ -1313,8 +2019,51 @@ impl<B: ChatBackend> Engine<B> {
                     )));
                 }
             }
+            // A server that does not know `stream_options` answers 400 to the
+            // whole request rather than ignoring the field. Asking for usage
+            // must never be the reason a turn fails, so drop it and ask again.
+            // This lives here rather than in any one backend: a custom backend
+            // bypasses the HTTP client's protocol fallback, and the engine is
+            // responsible for remembering the refusal for the session.
+            //
+            // Anthropic is excluded because its requests never carry the usage
+            // field; retrying its 400s without it would repeat an identical
+            // request and learn nothing.
+            if matches!(
+                &r,
+                Outcome::Done(Err(LlmError::Status { status: 400, .. }))
+            ) && current.endpoint.include_usage
+                && current.endpoint.stream
+                && matches!(
+                    current.endpoint.provider,
+                    Provider::OpenAiCompatible
+                        | Provider::Gemini
+                        | Provider::DeepSeek
+                        | Provider::OpenRouter
+                )
+                && !usage_retried
+                && !self.cancelled()
+            {
+                usage_retried = true;
+                current.endpoint.include_usage = false;
+                on_chunk(ChatChunk::Reset);
+                let retry = tokio::select! {
+                    r = self.backend.chat(&current, on_chunk) => Outcome::Done(r),
+                    _ = &mut skip_rx => Outcome::Skipped,
+                };
+                r = match retry {
+                    Outcome::Done(Ok(mut resp)) => {
+                        resp.notes.push(
+                            "this server rejected the usage request; retrying without token counts"
+                                .to_string(),
+                        );
+                        Outcome::Done(Ok(resp))
+                    }
+                    other => other,
+                };
+            }
             let transient = matches!(&r, Outcome::Done(Err(e)) if e.is_transient());
-            let budget = req.endpoint.timeout_secs.clamp(10, 3600) as f64;
+            let budget = current.endpoint.timeout_secs.clamp(10, 3600) as f64;
             let exhausted = used >= budget * 0.6;
             let again = worth_retrying(transient, exhausted, attempt, RETRIES)
                 && !self.cancelled();
@@ -1354,6 +2103,23 @@ impl<B: ChatBackend> Engine<B> {
         };
         hb.abort();
         *self.skip_tx.lock().expect("skip") = None;
+
+        // The prompt was refused for being too long, and retrying it unchanged
+        // only produces the same 400. This is the last thing tried before the
+        // seat loses its turn: shorten the delegate's own history using the round
+        // summaries, and send that once.
+        //
+        // Deliberately after the retry loop rather than inside it. A 400 is
+        // permanent by `is_transient`, so the loop would never reach here on its
+        // own — which is the point: this is not another attempt at the same
+        // request, it is a different, smaller one.
+        let outcome = match &outcome {
+            Outcome::Done(Err(e)) if e.is_context_overflow() => {
+                self.compact_and_retry(&current, turn, who, on_chunk).await
+            }
+            _ => outcome,
+        };
+
         // One hook for every kind of request — speeches, ballots, the summary,
         // the closing, a continuation after reading — so the running cost is
         // complete by construction rather than by remembering each call site.
@@ -1368,7 +2134,7 @@ impl<B: ChatBackend> Engine<B> {
                 self.usage_unsupported
                     .lock()
                     .expect("usage")
-                    .insert(req.endpoint.id.clone());
+                    .insert(current.endpoint.id.clone());
             }
             if let Some(u) = resp.usage {
                 self.sink.emit(EngineEvent::TurnUsage {
@@ -1380,6 +2146,123 @@ impl<B: ChatBackend> Engine<B> {
             }
         }
         outcome
+    }
+
+    /// Shorten one delegate's history and send the turn again, once.
+    ///
+    /// Returns the original failure unchanged when there is nothing to give up,
+    /// so the caller reports the refusal rather than an invented second one. The
+    /// compacted history is written back to the board, which is what stops the
+    /// next turn from overflowing again immediately — resending a one-off short
+    /// prompt without remembering the shortening would fix exactly one turn.
+    async fn compact_and_retry(
+        &self,
+        req: &ChatRequest,
+        turn: TurnId,
+        who: &str,
+        on_chunk: &(dyn for<'a> Fn(ChatChunk<'a>) + Send + Sync),
+    ) -> Outcome<ChatResponse> {
+        // Named up front: the nothing-left branch below returns from inside the
+        // board lock, and `label_of_id` takes that same lock — evaluating it
+        // there deadlocked the turn forever on a non-reentrant mutex.
+        let label = self.label_of_id(who);
+        let (shortened, what) = {
+            let b = self.board.lock().expect("board");
+            let history = b.history.get(who).cloned().unwrap_or_default();
+            let summaries = round_summaries(&b);
+            match compact_history(&history, &summaries) {
+                Some((out, what)) => (out, what),
+                None => {
+                    // Nothing left to trade: the prompt is the system message,
+                    // the opening and the current brief, and dropping any of
+                    // those is not a compaction.
+                    self.sink.emit(EngineEvent::Notice {
+                        text: format!(
+                            "{who}'s prompt is over the model's context window and \
+                             there is nothing left to shorten — this turn is lost"
+                        ),
+                        tone: NoticeTone::Warn,
+                    });
+                    return Outcome::Done(Err(LlmError::Stream(format!(
+                        "{label}: the prompt does not fit the context window and no history \
+                         could be dropped to make it fit"
+                    ))));
+                }
+            }
+        };
+
+        // Persist before resending. If this attempt fails too, the shortened
+        // history is still the one the next turn should use.
+        self.board
+            .lock()
+            .expect("board")
+            .history
+            .insert(who.to_string(), shortened.clone());
+
+        self.sink.emit(EngineEvent::Notice {
+            text: if what.clipped_without_summaries {
+                format!(
+                    "{who} ran out of context window — its earlier speeches were \
+                     shortened to fit. Nothing has been summarised yet, so the \
+                     beginning of its own argument is now clipped"
+                )
+            } else {
+                format!(
+                    "{who} ran out of context window — {} earlier message{} replaced \
+                     by {} round summar{} to fit",
+                    what.dropped_messages,
+                    if what.dropped_messages == 1 { "" } else { "s" },
+                    what.summaries_used,
+                    if what.summaries_used == 1 { "y" } else { "ies" },
+                )
+            },
+            tone: NoticeTone::Warn,
+        });
+
+        let retry = ChatRequest {
+            messages: shortened,
+            ..req.clone()
+        };
+        on_chunk(ChatChunk::Reset);
+        let (skip_tx, mut skip_rx) = tokio::sync::oneshot::channel();
+        *self.skip_tx.lock().expect("skip") = Some(skip_tx);
+        let began = std::time::Instant::now();
+        let r = tokio::select! {
+            r = self.backend.chat(&retry, on_chunk) => r,
+            _ = &mut skip_rx => {
+                *self.skip_tx.lock().expect("skip") = None;
+                return Outcome::Skipped;
+            }
+        };
+        let _ = began.elapsed();
+        *self.skip_tx.lock().expect("skip") = None;
+        match r {
+            Ok(resp) => {
+                if let Some(u) = resp.usage {
+                    self.sink.emit(EngineEvent::TurnUsage {
+                        turn,
+                        delegate: who.to_string(),
+                        prompt_tokens: u.prompt_tokens,
+                        completion_tokens: u.completion_tokens,
+                    });
+                }
+                Outcome::Done(Ok(resp))
+            }
+            Err(e) => {
+                // It did not fit even shortened. Say so plainly: the operator
+                // needs to know a turn was lost to the window, not guess.
+                self.sink.emit(EngineEvent::Notice {
+                    text: format!(
+                        "{who} still does not fit after shortening ({}) — this turn is \
+                         lost. Raise the model's context window, or shorten the \
+                         debate's rounds.",
+                        e
+                    ),
+                    tone: NoticeTone::Warn,
+                });
+                Outcome::Done(Err(e))
+            }
+        }
     }
 
     /// A decision-model classification with the same heartbeat and skip hatch
@@ -1421,22 +2304,38 @@ impl<B: ChatBackend> Engine<B> {
     // -- a single turn ---------------------------------------------------
 
     async fn take_turn(&self, id: &str, round: u32) -> Result<(), String> {
-        let (messages, endpoint, model, temperature, native, label, color, restore) = {
+        let (messages, endpoint, model, temperature, native, human, label, color, pressed_before, seen_before) = {
             let mut b = self.board.lock().expect("board");
-            let (Some(me), Some(ep)) = (b.delegate(id).cloned(), b.endpoint_for(id)) else {
+            let me = b.delegate(id).cloned();
+            let ep = b.endpoint_for(id);
+            let Some(me) = me else {
                 return Err("no endpoint is configured for this seat".into());
+            };
+            // A taken seat has no endpoint by design — the operator is the
+            // model. Anything else without one cannot argue at all.
+            let human = me.human && me.seat_role.argues();
+            let ep = match ep {
+                Some(ep) => ep,
+                // Placeholder, never called: the human branch below returns
+                // before any request is built. `native` is forced true so
+                // submitted calls are honoured, not scraped out of prose.
+                None if human => EndpointConfig::default(),
+                None => return Err("no endpoint is configured for this seat".into()),
             };
             // Read before the prompt, not after: the prompt has to describe the
             // belt this seat is actually given, and that belt depends on both.
-            let native = ep.native_tools;
+            let native = if human { true } else { ep.native_tools };
             let judging = me.seat_role == SeatRole::Judge;
-            let system = prompt::system_prompt(&me, &b.config, native, judging);
             let mut history = b
                 .history
                 .remove(id)
                 .unwrap_or_default();
             if history.is_empty() {
-                history.push(ChatMessage::system(system));
+                // Built only for a fresh seat: the prompt render walks the
+                // whole roster and is wasted on every later turn.
+                history.push(ChatMessage::system(prompt::system_prompt(
+                    &me, &b.config, native, judging,
+                )));
                 // Images ride on the opening message: every seat's history
                 // starts here, and history is trimmed to the opening plus the
                 // last few turns, so they stay visible without being resent
@@ -1451,7 +2350,7 @@ impl<B: ChatBackend> Engine<B> {
                     .collect();
                 history.push(opening);
             }
-            let board_text = prompt::board_snapshot(&b.points, &b.config.delegates);
+            let board_text = b.board_snapshot_cached();
             // Captured before anything below clears or advances them. Both used
             // to be read *after* the press queue was drained and the `seen` mark
             // moved, which made `TurnRollback` restore the cleared state rather
@@ -1473,25 +2372,20 @@ impl<B: ChatBackend> Engine<B> {
                 all_unseen
             };
             let budget = auto_record_budget(b.points.len());
-            let mut since = unseen
-                .iter()
-                .map(|e| {
-                    let who = b
-                        .delegate(&e.delegate)
-                        .map(|d| d.label.clone())
-                        .unwrap_or_else(|| e.delegate.clone());
-                    format!("R{} {}: {}", e.round, who, e.text)
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            while since.chars().count() > budget {
-                let cut = since
-                    .char_indices()
-                    .nth(since.chars().count() - budget + 1)
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
-                since = since[cut..].to_string();
-            }
+            let since = tail_clip(
+                unseen
+                    .iter()
+                    .map(|e| {
+                        let who = b
+                            .delegate(&e.delegate)
+                            .map(|d| d.label.clone())
+                            .unwrap_or_else(|| e.delegate.clone());
+                        format!("R{} {}: {}", e.round, who, e.text)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                budget,
+            );
 
             let mut floor = String::new();
             if !pressed_before.is_empty() {
@@ -1523,6 +2417,12 @@ impl<B: ChatBackend> Engine<B> {
                 "{board_text}\n\n———\n\n{floor}"
             )));
             prune_superseded_briefs(&mut history);
+            // This is the speaking path, and it is the one that builds the shape
+            // `normalize_history` exists for: pruning is what leaves the seat's
+            // own replies adjacent from the third turn on. It has to run here,
+            // not only on the ballot paths — a seat that never ballots gets a
+            // malformed history forever.
+            normalize_history(&mut history);
             // Only what they were actually shown. The head the tail-truncation dropped can
             // never be shown to this seat again, so the mark advances over it —
             // but no further. Deriving it from `record.len()` instead ran the
@@ -1533,24 +2433,35 @@ impl<B: ChatBackend> Engine<B> {
             b.pressed.remove(id);
             b.history.insert(id.to_string(), history.clone());
 
-            // What to put back if the turn never happens: a skip or a failure
-            // used to leave the delegate holding an unanswered user message,
-            // a cleared press queue, and a `seen` mark for notes they never
-            // read. Consecutive user turns also break strict proxies.
-            let restore = TurnRollback {
-                history: history.clone(),
-                pressed: pressed_before,
-                seen: seen_before,
-            };
+            // One full copy per speaking turn: the stored history the next
+            // turn (and `compact_and_retry`) reads, plus the request below,
+            // which moves `history` itself. The second copy the old code took
+            // here — a `TurnRollback` snapshot sibling to the stored one — is
+            // gone: on the failure path the snapshot is rebuilt from the
+            // request, which still holds exactly what was stored (`req` is
+            // only ever borrowed after this point, and `compact_and_retry`
+            // replaces the *stored* history, never the request). So the common
+            // path pays one clone and only a failed turn pays two.
+            //
+            // The clones that remain are load-bearing, not laziness:
+            // - ballot/continuation/retry inserts must keep a stored copy AND
+            //   hand one to the request; either side is read afterwards, so
+            //   neither can be moved instead of cloned;
+            // - `compact_and_retry` persists the shortened history before
+            //   resending so the *next* turn stays shortened even if this one
+            //   fails — persisting after success instead would fix one turn
+            //   and re-overflow the next.
             (
                 history,
                 ep,
                 me.model.clone(),
                 me.temperature.or(Some(0.4)),
                 native,
+                human,
                 me.label.clone(),
                 me.color.clone(),
-                restore,
+                pressed_before,
+                seen_before,
             )
         };
 
@@ -1569,6 +2480,14 @@ impl<B: ChatBackend> Engine<B> {
             model: model.clone(),
             round,
         });
+
+        // The brief the operator answers from: the board-plus-floor text a
+        // model would be shown, cloned before the request takes the history.
+        let brief = if human {
+            messages.last().map(|m| m.content.clone()).unwrap_or_default()
+        } else {
+            String::new()
+        };
 
         let tools = if native {
             let (may_read, judging) = {
@@ -1630,7 +2549,14 @@ impl<B: ChatBackend> Engine<B> {
             }
         };
 
-        let outcome = self.race_request(&req, turn, id, &chunks, &on_chunk).await;
+        // A taken seat never reaches the network: the operator answers from
+        // the UI, and the submit rejoins the pipeline below indistinguishable
+        // from a model reply — same validation, same board, same record.
+        let outcome = if human {
+            self.await_human_turn(id, round, turn, brief).await
+        } else {
+            self.race_request(&req, turn, id, &chunks, &on_chunk).await
+        };
         content_pump.flush(true);
         thought_pump.flush(true);
 
@@ -1638,7 +2564,20 @@ impl<B: ChatBackend> Engine<B> {
             Outcome::Done(Ok(r)) => r,
             Outcome::Done(Err(e)) => {
                 let why = describe_llm_error(e);
-                self.rollback_turn(id, restore);
+                // What to put back when the turn never happens: without this
+                // the delegate is left holding an unanswered user message, a
+                // cleared press queue, and a `seen` mark for notes they never
+                // read. Consecutive user turns also break strict proxies.
+                // The snapshot comes from the request rather than a second
+                // up-front clone: it holds exactly what was stored above.
+                self.rollback_turn(
+                    id,
+                    TurnRollback {
+                        history: req.messages.clone(),
+                        pressed: pressed_before.clone(),
+                        seen: seen_before,
+                    },
+                );
                 // Still leave a mark on the record: a hole in the transcript
                 // reads as a silent seat rather than a failed request.
                 let speech = Speech {
@@ -1658,7 +2597,14 @@ impl<B: ChatBackend> Engine<B> {
                 return Err(why);
             }
             Outcome::Skipped => {
-                self.rollback_turn(id, restore);
+                self.rollback_turn(
+                    id,
+                    TurnRollback {
+                        history: req.messages.clone(),
+                        pressed: pressed_before,
+                        seen: seen_before,
+                    },
+                );
                 self.sink.emit(EngineEvent::TurnSkipped {
                     turn,
                     delegate: id.to_string(),
@@ -1719,7 +2665,15 @@ impl<B: ChatBackend> Engine<B> {
         } else if actions_log.is_empty() {
             // The other failure mode: a turn of announced intentions with no
             // tool calls behind them. One corrective re-prompt, then the
-            // inaction is labelled on the record.
+            // inaction is labelled on the record. A human submit is already
+            // deliberate — and validated — so there is nothing to correct, and
+            // re-prompting would address a model that is not there.
+            if human {
+                actions_log.push("(no actions taken this turn)".into());
+                self.finish_turn(id, round, turn, &label, text, thinking, calls, actions_log)
+                    .await;
+                return Ok(());
+            }
             let (text, thinking, calls, actions_log) = match self
                 .correct_inaction(id, round, turn, &text, &thinking, &calls, &req, &tools, native)
                 .await
@@ -1904,6 +2858,15 @@ impl<B: ChatBackend> Engine<B> {
             // The clip goes into the history only. The transcript, the export
             // and the screen all get the whole speech.
             hist.push(ChatMessage::assistant(clip_for_memory(&speech.text)));
+            // Images ride exactly once: the opening turn's request was built
+            // from this history *before* this push, so that first send is
+            // already on the wire byte-identical. From here the seat has been
+            // heard, and every later turn, ballot, retry and continuation
+            // built from this history would re-render (and re-bill) the same
+            // multi-MB data URLs. Clearing keeps the opening text — only the
+            // already-delivered bytes go — and a turn that never finishes never
+            // reaches here, so a failed first turn still retries with them.
+            strip_sent_images(hist);
             if hist.len() > 12 {
                 let head: Vec<ChatMessage> = hist.drain(..2).collect();
                 let tail: Vec<ChatMessage> = hist.split_off(hist.len().saturating_sub(8));
@@ -1933,6 +2896,13 @@ impl<B: ChatBackend> Engine<B> {
             let key =
                 serde_json::to_string(&(&call.name, &call.arguments)).unwrap_or_default();
             if !seen.insert(key) {
+                // A model that stutters the same call is taken at its word the
+                // first time, so the repeat is folded rather than applied. It
+                // still happened, though, and dropping it without comment means
+                // a turn made of nothing but repeats reaches the caller with an
+                // empty log and gets labelled as inaction — when the delegate
+                // had in fact acted, once, deliberately.
+                log.push(format!("(repeated {} — folded)", call.name));
                 continue;
             }
             let action = match tools::parse_action(call) {
@@ -1942,8 +2912,16 @@ impl<B: ChatBackend> Engine<B> {
                         turn,
                         delegate: id.to_string(),
                         tool: call.name.clone(),
-                        reason: why,
+                        reason: why.clone(),
                     });
+                    // Every other refusal in this loop writes a line to the log.
+                    // This one did not, so a delegate that called a tool the
+                    // parser rejected left `log` empty — and an empty log is
+                    // what the caller reads as "this turn did nothing". The
+                    // result was a seat that visibly tried to act, emitted a
+                    // notice saying why it could not, and was then labelled
+                    // "(no actions taken this turn)" as if it had sat silent.
+                    log.push(format!("(refused {}: {why})", call.name));
                     continue;
                 }
             };
@@ -2251,6 +3229,9 @@ impl<B: ChatBackend> Engine<B> {
             .unwrap_or_else(|| id.to_string());
 
         let emit_point = |b: &mut Board, point_id: PointId| {
+            // Every caller just mutated the points; version them for the
+            // snapshot cache in the same breath.
+            b.touch_points();
             if let Some(p) = b.points.iter().find(|p| p.id == point_id) {
                 let tally = p.tally(&b.ids);
                 let resolved = tally.decided();
@@ -2663,6 +3644,7 @@ impl<B: ChatBackend> Engine<B> {
                 closed: false,
                 outcome: None,
             });
+            b.touch_points();
             b.note(id, round, line.clone());
         }
         let (point, tally, resolved, review) = {
@@ -2798,6 +3780,29 @@ impl<B: ChatBackend> Engine<B> {
         opener: &str,
         opener_turn: TurnId,
     ) -> Option<(String, Option<String>, Option<f64>)> {
+        // A taken seat answers its own poll. Asked before the endpoint is
+        // looked up, because a human seat has none by design.
+        if self.is_human(voter) {
+            let answer = self
+                .await_human_ballot(
+                    voter,
+                    BallotKind::Poll,
+                    format!("{} asks: {question}", opener_label_of(self, opener)),
+                    options.to_vec(),
+                    None,
+                )
+                .await?;
+            return match answer {
+                HumanBallot::Poll {
+                    choice,
+                    reason,
+                    confidence,
+                } => Some((choice, reason, confidence)),
+                // Only the poll variant reaches here; the pending ballot's kind
+                // and the submit's variant are checked as a pair.
+                _ => None,
+            };
+        }
         let (messages, endpoint, model, temperature, native, label) = {
             let mut b = self.board.lock().expect("board");
             let me = b.delegate(voter)?.clone();
@@ -2829,6 +3834,10 @@ impl<B: ChatBackend> Engine<B> {
                 },
                 opener,
             )));
+            // The template expects the roles to alternate, and this
+            // history has just had a question appended to whatever the seat
+            // last said — which is a second message of the same role.
+            normalize_history(&mut history);
             b.history.insert(voter.to_string(), history.clone());
             (
                 history,
@@ -2862,8 +3871,7 @@ impl<B: ChatBackend> Engine<B> {
         let ext = self.decider.lock().expect("decider").clone();
         if let Some(ext) = ext {
             let context = {
-                let b = self.board.lock().expect("board");
-                Self::ballot_context(&b)
+                self.board.lock().expect("board").ballot_context_cached()
             };
             let label = label.clone();
             let req = ClassifyRequest {
@@ -2951,47 +3959,54 @@ impl<B: ChatBackend> Engine<B> {
             }
             return None;
         };
-        // Snap to a real option; models paraphrase.
-        let choice = options
-            .iter()
-            .find(|o| {
-                o.eq_ignore_ascii_case(&choice)
-                    || o.to_ascii_lowercase().contains(&choice.to_ascii_lowercase())
-                    || choice.to_ascii_lowercase().contains(&o.to_ascii_lowercase())
-            })
-            .cloned()
-            .unwrap_or(choice);
+        // Snap to a real option; models paraphrase. Exact first, then a
+        // word-boundary phrase match, and never a bare substring in either
+        // direction: the bidirectional check made "unsupported" match "supported"
+        // and take the *first* option, so a seat saying "unsupported" voted
+        // "supported".
+        let choice = {
+            let answer = choice.trim().to_ascii_lowercase();
+            options
+                .iter()
+                .find(|o| o.trim().to_ascii_lowercase() == answer)
+                .or_else(|| {
+                    options.iter().find(|o| {
+                        let opt = o.trim().to_ascii_lowercase();
+                        !opt.is_empty() && answer.split(|c: char| !c.is_alphanumeric())
+                            .any(|word| word == opt)
+                    })
+                })
+                .cloned()
+                .unwrap_or_else(|| {
+                    // Unreadable. Kept verbatim before, which put the ballot in
+                    // `p.ballots` where `Poll::result` — matching options by exact
+                    // case-insensitive equality — counted it for *no* option. The
+                    // record then showed two ballots cast and the summary read "no
+                    // seat answered — nothing was decided", with every option at
+                    // zero. Bucket it explicitly so the count and the record agree.
+                    let raw = choice.trim();
+                    format!("(unrecognised: {raw})")
+                })
+        };
         Some((choice, reason, None))
     }
 
     /// What a voter gets to ground a ballot: the board plus the tail
     /// of the record. Deliberation stays with the seats; this is just enough
     /// context to answer honestly.
+    ///
+    /// Test-only: the uncached spelling, and the reference the cache-equality
+    /// test compares against. Live paths use `Board::ballot_context_cached`.
+    #[cfg(test)]
     fn ballot_context(b: &Board) -> String {
         let board = prompt::board_snapshot(&b.points, &b.config.delegates);
-        let tail: Vec<String> = b
-            .record
-            .iter()
-            .rev()
-            .take(10)
-            .map(|e| {
-                let who = b
-                    .delegate(&e.delegate)
-                    .map(|d| d.label.clone())
-                    .unwrap_or_else(|| e.delegate.clone());
-                format!("R{} {}: {}", e.round, who, e.text)
-            })
-            .collect();
-        let mut ctx = format!("{board}\n\nRECENT RECORD (newest last):\n{}", tail.iter().rev().cloned().collect::<Vec<_>>().join("\n"));
-        while ctx.chars().count() > 2_500 {
-            let cut = ctx
-                .char_indices()
-                .nth(ctx.chars().count() - 2_500 + 1)
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-            ctx = ctx[cut..].to_string();
-        }
-        ctx
+        tail_clip(
+            format!(
+                "{board}\n\nRECENT RECORD (newest last):\n{}",
+                ballot_record_tail(b)
+            ),
+            2_500,
+        )
     }
 
     // -- deadlock reviews --------------------------------------------------
@@ -3033,8 +4048,17 @@ impl<B: ChatBackend> Engine<B> {
                     // A changed vote lands immediately: the review is the
                     // sanctioned moment to change your mind, and the tally
                     // moves while everyone watches.
+                    //
+                    // Written straight into the point, bypassing `apply_actions`, so
+                    // no record line was written for it: a model seat's companion
+                    // vote goes through `apply_ballot_companions` and is noted, and
+                    // the operator's own record entry is the only evidence of the
+                    // decision that carried the point. `conceded_by.remove` was
+                    // silent too — a concession with its stated reason vanished.
                     if let Some(v) = vote {
+                        let mut changed = false;
                         if let Some(p) = b.point_mut(point_id) {
+                            changed = p.votes.get(&voter).map(|r| r.verdict) != Some(v);
                             p.votes.insert(
                                 voter.clone(),
                                 VoteRecord {
@@ -3044,7 +4068,18 @@ impl<B: ChatBackend> Engine<B> {
                                     round,
                                 },
                             );
-                            p.conceded_by.remove(&voter);
+                            changed |= p.conceded_by.remove(&voter).is_some();
+                        }
+                        // Votes and their reasons print on the snapshot, so
+                        // any insert — even one that keeps the verdict —
+                        // changes it.
+                        b.touch_points();
+                        if changed {
+                            b.note(
+                                &voter,
+                                round,
+                                format!("re-votes P{point_id} {}", v.as_str()),
+                            );
                         }
                     }
                     let result = {
@@ -3148,6 +4183,39 @@ impl<B: ChatBackend> Engine<B> {
         opener: &str,
         opener_turn: TurnId,
     ) -> Option<(StalemateReading, Option<String>, Option<Verdict>)> {
+        // The reading names *why* a point is stuck, so the options are the
+        // three rulings themselves rather than a display string.
+        if self.is_human(voter) {
+            let point_text = {
+                let b = self.board.lock().expect("board");
+                b.point(point_id).map(|p| p.text.clone()).unwrap_or_default()
+            };
+            let answer = self
+                .await_human_ballot(
+                    voter,
+                    BallotKind::Review,
+                    format!(
+                        "This point is deadlocked and cannot be adjourned over until the council \
+                         says why. Does the record show it is unsolvable, too dense for this \
+                         council, or decidable?\n\nThe point: {point_text}"
+                    ),
+                    vec![
+                        StalemateReading::Unsolvable.as_str().to_string(),
+                        StalemateReading::TooDense.as_str().to_string(),
+                        StalemateReading::Decidable.as_str().to_string(),
+                    ],
+                    Some(point_id),
+                )
+                .await?;
+            return match answer {
+                HumanBallot::Review {
+                    reading,
+                    reason,
+                    vote,
+                } => Some((reading, reason, vote)),
+                _ => None,
+            };
+        }
         let (messages, endpoint, model, temperature, native, label) = {
             let mut b = self.board.lock().expect("board");
             let me = b.delegate(voter)?.clone();
@@ -3181,6 +4249,10 @@ impl<B: ChatBackend> Engine<B> {
                 &opener_label,
                 round,
             )));
+            // The template expects the roles to alternate, and this
+            // history has just had a question appended to whatever the seat
+            // last said — which is a second message of the same role.
+            normalize_history(&mut history);
             b.history.insert(voter.to_string(), history.clone());
             (
                 history,
@@ -3323,8 +4395,7 @@ impl<B: ChatBackend> Engine<B> {
             )
         };
         let board_text = {
-            let b = self.board.lock().expect("board");
-            prompt::board_snapshot(&b.points, &b.config.delegates)
+            self.board.lock().expect("board").board_snapshot_cached()
         };
         let record_tail = {
             let b = self.board.lock().expect("board");
@@ -3343,14 +4414,7 @@ impl<B: ChatBackend> Engine<B> {
                 .collect();
             tail.reverse();
             let mut s = tail.join("\n");
-            while s.chars().count() > 6_000 {
-                let cut = s
-                    .char_indices()
-                    .nth(s.chars().count() - 6_000 + 1)
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
-                s = s[cut..].to_string();
-            }
+            s = tail_clip(s, 6_000);
             s
         };
         let messages = {
@@ -3366,6 +4430,10 @@ impl<B: ChatBackend> Engine<B> {
                 "{board_text}\n\nRECENT RECORD:\n{record_tail}\n\n———\n\n{}",
                 prompt::intermission_prompt(round, planned, extra_left)
             )));
+            // The template expects the roles to alternate, and this
+            // history has just had a question appended to whatever the seat
+            // last said — which is a second message of the same role.
+            normalize_history(&mut history);
             b.history.insert(me_id.clone(), history.clone());
             history
         };
@@ -3751,8 +4819,7 @@ impl<B: ChatBackend> Engine<B> {
             )
         };
         let board_text = {
-            let b = self.board.lock().expect("board");
-            prompt::board_snapshot(&b.points, &b.config.delegates)
+            self.board.lock().expect("board").board_snapshot_cached()
         };
         let tally_line = self.tally_line();
         let prompt_text = {
@@ -4130,6 +5197,40 @@ impl<B: ChatBackend> Engine<B> {
         round: u32,
         opener_turn: TurnId,
     ) -> Option<(bool, Option<String>)> {
+        if self.is_human(voter) {
+            let (mover_label, motion) = {
+                let b = self.board.lock().expect("board");
+                let label = b
+                    .delegate(mover)
+                    .map(|d| d.label.clone())
+                    .unwrap_or_else(|| mover.to_string());
+                let motion = b
+                    .record
+                    .iter()
+                    .rev()
+                    .find(|e| e.delegate == mover)
+                    .map(|e| e.text.clone())
+                    .unwrap_or_else(|| "the record is exhausted".to_string());
+                (label, motion)
+            };
+            let answer = self
+                .await_human_ballot(
+                    voter,
+                    BallotKind::Adjourn,
+                    format!(
+                        "{mover_label} wants to end the debate early: \u{201c}{motion}\u{201d}\n\n\
+                         Do you confirm? The mover counts as one vote in favour, and a strict \
+                         majority of the seats that may vote has to agree."
+                    ),
+                    vec!["yes".to_string(), "no".to_string()],
+                    None,
+                )
+                .await?;
+            return match answer {
+                HumanBallot::Adjourn { confirm, reason } => Some((confirm, reason)),
+                _ => None,
+            };
+        }
         let (messages, endpoint, model, temperature, native, label) = {
             let mut b = self.board.lock().expect("board");
             let me = b.delegate(voter)?.clone();
@@ -4160,11 +5261,15 @@ impl<B: ChatBackend> Engine<B> {
                         ChatMessage::user(prompt::opening_message(&b.config)),
                     ]
                 });
-            let context = Self::ballot_context(&b);
+            let context = b.ballot_context_cached();
             history.push(ChatMessage::user(format!(
                 "{context}\n\n———\n\n{}",
                 prompt::adjourn_confirm_prompt(&mover_label, &motion, round)
             )));
+            // The template expects the roles to alternate, and this
+            // history has just had a question appended to whatever the seat
+            // last said — which is a second message of the same role.
+            normalize_history(&mut history);
             b.history.insert(voter.to_string(), history.clone());
             (
                 history,
@@ -4352,6 +5457,29 @@ impl<B: ChatBackend> Engine<B> {
         reason: &str,
         opener_turn: TurnId,
     ) -> Option<(bool, Option<String>)> {
+        // Asked of the whole room, taken seat included: a human whose seat is
+        // asked whether the debate needs more rounds has as much claim to the
+        // answer as any other voter.
+        if self.is_human(voter) {
+            let answer = self
+                .await_human_ballot(
+                    voter,
+                    BallotKind::Extension,
+                    format!(
+                        "The Summarizer asks for {ask} more round{}\n\nIts reason: {reason}\n\n\
+                         Is there something another round would settle? Grant only if so — a \
+                         council that keeps re-opening cannot finish.",
+                        if ask == 1 { "" } else { "s" }
+                    ),
+                    vec!["grant".to_string(), "decline".to_string()],
+                    None,
+                )
+                .await?;
+            return match answer {
+                HumanBallot::Extension { grant, reason } => Some((grant, reason)),
+                _ => None,
+            };
+        }
         let (messages, endpoint, model, temperature, native, label) = {
             let mut b = self.board.lock().expect("board");
             let me = b.delegate(voter)?.clone();
@@ -4371,11 +5499,15 @@ impl<B: ChatBackend> Engine<B> {
                         ChatMessage::user(prompt::opening_message(&b.config)),
                     ]
                 });
-            let context = Self::ballot_context(&b);
+            let context = b.ballot_context_cached();
             history.push(ChatMessage::user(format!(
                 "{context}\n\n———\n\n{}",
                 prompt::extension_ballot_prompt(ask, reason, round)
             )));
+            // The template expects the roles to alternate, and this
+            // history has just had a question appended to whatever the seat
+            // last said — which is a second message of the same role.
+            normalize_history(&mut history);
             b.history.insert(voter.to_string(), history.clone());
             (
                 history,
@@ -4612,24 +5744,98 @@ impl<B: ChatBackend> Engine<B> {
     // -- closing and verdict ---------------------------------------------
 
     async fn closing_address(&self, id: &str) {
-        let (messages, endpoint, model, temperature, label, color, round) = {
+        // A taken seat gets asked, like every other thing it is asked. Every other
+        // path checks `is_human` first — the four ballot casts and `take_turn` —
+        // and this one did not, so with closing statements on the operator's seat
+        // received a closing address written by whatever model had been configured
+        // for it, streamed into the transcript under their name, without ever being
+        // asked. That is not a draft they can see and change; it is an argument
+        // attributed to a person that they never made.
+        let (messages, endpoint, model, temperature, label, color, round, human, brief) = {
             let mut b = self.board.lock().expect("board");
-            let (Some(me), Some(ep)) = (b.delegate(id).cloned(), b.endpoint_for(id)) else {
+            let Some(me) = b.delegate(id).cloned() else {
                 return;
             };
+            // Read off `me`, not via `self.is_human(id)` — that helper takes the
+            // board lock itself, and this block is holding it. `is_human` was
+            // called from the other five sites *outside* their board scopes, which
+            // is the only reason it survived until now.
+            let human = me.human && me.seat_role.argues();
+            let endpoint = b.endpoint_for(id);
             let mut history = b.history.remove(id).unwrap_or_default();
-            history.push(ChatMessage::user(prompt::closing_prompt(&b.config)));
+            // A seat that never took a turn has no entry at all, and the prompt was
+            // then a single user message: no system prompt, so no role, no persona,
+            // no procedural rules and no board. With auto-adjourn on, the Arbiter
+            // can reach here having said nothing, and write a closing address about
+            // "the record" while having been shown none. Built the way `take_turn`
+            // builds it.
+            if history.is_empty() {
+                let native = endpoint.as_ref().map_or(false, |e: &crate::types::EndpointConfig| e.native_tools);
+                history.push(ChatMessage::system(prompt::system_prompt(
+                    &me,
+                    &b.config,
+                    native,
+                    me.seat_role == SeatRole::Judge,
+                )));
+                history.push(ChatMessage::user(prompt::opening_message(&b.config)));
+            }
+            let brief = prompt::closing_prompt(&b.config);
+            history.push(ChatMessage::user(brief.clone()));
+            // The template expects the roles to alternate, and this
+            // history has just had a question appended to whatever the seat
+            // last said — which is a second message of the same role.
+            normalize_history(&mut history);
             b.history.insert(id.to_string(), history.clone());
             let round = b.round;
             (
                 history,
-                ep,
+                endpoint,
                 me.model.clone(),
                 me.temperature.or(Some(0.6)),
                 me.label,
                 me.color,
                 round,
+                human,
+                brief,
             )
+        };
+        if human {
+            // Park for the human, same as a speaking turn. Skipped or stopped, this
+            // seat simply has no closing address, which is true rather than invented.
+            let turn = {
+                let mut b = self.board.lock().expect("board");
+                let t = b.next_turn;
+                b.next_turn += 1;
+                t
+            };
+            self.sink.emit(EngineEvent::TurnStarted {
+                turn,
+                delegate: id.to_string(),
+                label: label.clone(),
+                color,
+                model: model.clone(),
+                round,
+            });
+            let prompt_text = messages
+                .last()
+                .map(|m| m.content.clone())
+                .unwrap_or_else(|| brief.clone());
+            match self.await_human_turn(id, round, turn, prompt_text).await {
+                Outcome::Done(Ok(resp)) => {
+                    let text = resp.content.clone();
+                    let thinking = resp.reasoning.clone();
+                    let calls = resp.tool_calls.clone();
+                    self.finish_turn(id, round, turn, &label, text, thinking, calls, Vec::new())
+                        .await;
+                }
+                // Skipped, stopped or refused: no closing address, said plainly
+                // rather than filled in by the model.
+                _ => {}
+            }
+            return;
+        }
+        let Some(endpoint) = endpoint else {
+            return;
         };
         let turn = {
             let mut b = self.board.lock().expect("board");
@@ -4814,6 +6020,86 @@ impl Board {
     fn point_mut(&mut self, id: PointId) -> Option<&mut Point> {
         self.points.iter_mut().find(|p| p.id == id)
     }
+
+    /// Mark the points changed for the prompt caches below.
+    ///
+    /// Called after every points mutation. Over-bumping only costs a
+    /// recompute, while a missed bump would serve a stale board — so when in
+    /// doubt, bump. (`note` does not bump: the record is keyed by length, and
+    /// polls are not part of either cached rendering.)
+    fn touch_points(&mut self) {
+        self.points_version = self.points_version.wrapping_add(1);
+    }
+
+    /// `prompt::board_snapshot`, memoized per points version.
+    ///
+    /// The snapshot renders points plus the fixed-at-convene roster, so the
+    /// version alone decides freshness. A poll asks every seat in turn while
+    /// the board sits still, which used to re-render the same string per
+    /// voter; now the first voter pays and the rest hit the cache. The cached
+    /// string is the same one `board_snapshot` returns — a test pins that.
+    fn board_snapshot_cached(&mut self) -> String {
+        let v = self.points_version;
+        if let Some((cached_v, s)) = &self.snapshot_cache {
+            if *cached_v == v {
+                return s.clone();
+            }
+        }
+        let s = prompt::board_snapshot(&self.points, &self.config.delegates);
+        self.snapshot_cache = Some((v, s.clone()));
+        s
+    }
+
+    /// The full ballot context (board plus record tail), memoized per
+    /// (points version, record length).
+    ///
+    /// Sharing one poll-wide string across voters would be stale: companion
+    /// votes mutate points between ballots and each ballot is noted on the
+    /// record, so a later voter genuinely sees a different context. This key
+    /// shares only what is identical — same board, same record length — and
+    /// recomputes on any change, so cached and fresh strings always agree.
+    fn ballot_context_cached(&mut self) -> String {
+        let v = self.points_version;
+        let rlen = self.record.len();
+        if let Some((cached_v, cached_r, s)) = &self.ballot_cache {
+            if *cached_v == v && *cached_r == rlen {
+                return s.clone();
+            }
+        }
+        let board = self.board_snapshot_cached();
+        let ctx = tail_clip(
+            format!(
+                "{board}\n\nRECENT RECORD (newest last):\n{}",
+                ballot_record_tail(self)
+            ),
+            2_500,
+        );
+        self.ballot_cache = Some((v, rlen, ctx.clone()));
+        ctx
+    }
+}
+
+/// The record tail every ballot context carries: the last 10 entries, newest
+/// last, unclipped.
+///
+/// One definition for both the fresh builder (`Engine::ballot_context`) and
+/// the cached one, so they can never disagree. Clipping stays where it was —
+/// on the whole assembled context — so both spellings produce the same bytes.
+fn ballot_record_tail(b: &Board) -> String {
+    let tail: Vec<String> = b
+        .record
+        .iter()
+        .rev()
+        .take(10)
+        .map(|e| {
+            let who = b
+                .delegate(&e.delegate)
+                .map(|d| d.label.clone())
+                .unwrap_or_else(|| e.delegate.clone());
+            format!("R{} {}: {}", e.round, who, e.text)
+        })
+        .collect();
+    tail.iter().rev().cloned().collect::<Vec<_>>().join("\n")
 }
 
 /// Whether `hay` contains `needle` as a whole word or phrase.
@@ -4855,6 +6141,7 @@ fn briefs(b: &Board) -> Vec<DelegateBrief> {
             color: d.color.clone(),
             endpoint: d.endpoint_id.clone(),
             role: d.seat_role,
+            human: d.human,
         })
         .collect()
 }
@@ -4893,6 +6180,82 @@ fn auto_record_budget(points: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_assistant_turn_never_reaches_a_template() {
+        // The degenerate case behind the loop: two assistant turns in a row,
+        // both empty, because a delegate that only made tool calls wrote no
+        // prose. Shown that, a local model fills the void by repeating itself.
+        let mut history: Vec<ChatMessage> = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("opening"),
+            ChatMessage::assistant(""),
+            ChatMessage::assistant(""),
+            ChatMessage::assistant("a real reply"),
+            ChatMessage::assistant(""),
+            ChatMessage::user("brief"),
+        ];
+        normalize_history(&mut history);
+        let roles: Vec<&str> = history.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, vec!["system", "user", "assistant", "user"]);
+        assert_eq!(
+            history[2].content, "a real reply",
+            "the surviving reply must be the one that said something"
+        );
+    }
+
+    #[test]
+    fn two_replies_in_a_row_are_joined_rather_than_dropped() {
+        // Merging, not discarding: the words are the delegate's own memory of
+        // its argument, and the model may refer back to them.
+        let mut history: Vec<ChatMessage> = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("opening"),
+            ChatMessage::assistant("first"),
+            ChatMessage::assistant("second"),
+            ChatMessage::user("brief"),
+        ];
+        normalize_history(&mut history);
+        assert_eq!(history.len(), 4);
+        assert!(history[2].content.contains("first"));
+        assert!(history[2].content.contains("second"));
+    }
+
+    #[test]
+    fn an_alternating_history_is_untouched() {
+        // The fix is about runs only, and must not reshape a correct
+        // conversation — including the opening turn's two user messages, which
+        // are deliberately left alone.
+        let mut history: Vec<ChatMessage> = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("opening"),
+            ChatMessage::assistant("first"),
+            ChatMessage::user("brief"),
+        ];
+        let before: Vec<(String, String)> = history
+            .iter()
+            .map(|m| (m.role.clone(), m.content.clone()))
+            .collect();
+        normalize_history(&mut history);
+        let after: Vec<(String, String)> = history
+            .iter()
+            .map(|m| (m.role.clone(), m.content.clone()))
+            .collect();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn images_survive_normalisation() {
+        // The opening message is the only one carrying images, and it is never
+        // merged with anything — asserted here so a future widening of the
+        // merge cannot quietly drop the motion's pictures.
+        let mut opening = ChatMessage::user("opening");
+        opening.images = vec!["data:image/png;base64,AAA".into()];
+        let mut history = vec![ChatMessage::system("system"), opening, ChatMessage::assistant("")];
+        normalize_history(&mut history);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].images.len(), 1, "the attached image was dropped");
+    }
 
     #[test]
     fn a_blip_is_retried_but_a_stall_is_not() {
@@ -4956,6 +6319,408 @@ mod tests {
         assert_eq!(auto_record_budget(0), 1_500);
         assert_eq!(auto_record_budget(5), 3_500);
         assert_eq!(auto_record_budget(100_000), 12_000);
+    }
+
+    fn push_entry(b: &mut Board, delegate: &str, round: u32, text: &str) {
+        b.record.push(RecordEntry {
+            delegate: delegate.into(),
+            round,
+            text: text.into(),
+        });
+    }
+
+    /// A history shaped like a real one: system, opening, some turns, and the
+    /// current brief. Every compaction assertion is made against this so the
+    /// tests describe the shape the engine actually builds.
+    fn history(turns: usize) -> Vec<ChatMessage> {
+        let mut h = vec![
+            ChatMessage::system("SYSTEM"),
+            ChatMessage::user("OPENING with images"),
+        ];
+        for i in 0..turns {
+            h.push(ChatMessage::assistant(format!("SPEECH {i}")));
+            h.push(ChatMessage::user(format!("USER {i}")));
+        }
+        h.push(ChatMessage::user("THE BOARD\n\n———\n\nROUND 1 — you have the floor."));
+        h
+    }
+
+    #[test]
+    fn compaction_keeps_the_system_the_opening_and_the_current_brief() {
+        // The prompt is assembled around these three. Dropping any of them is
+        // not a compaction, it is amnesia.
+        let h = history(6);
+        let (out, what) = compact_history(&h, &["R1: they argued about roses".into()])
+            .expect("six turns is something to compact");
+        assert_eq!(out[0].content, "SYSTEM", "the system prompt must survive");
+        assert!(
+            out.iter().any(|m| m.content.starts_with("OPENING")),
+            "the opening message carries the attached images"
+        );
+        assert!(
+            out.last().unwrap().content.starts_with("THE BOARD"),
+            "the current brief must be last, since the floor text is appended to it"
+        );
+        assert!(what.dropped_messages > 0);
+    }
+
+    #[test]
+    fn compaction_really_shrinks_the_prompt() {
+        let h = history(20);
+        let before: usize = h.iter().map(|m| m.content.len()).sum();
+        let (out, _) = compact_history(&h, &["R1: summary".into()]).expect("compacts");
+        let after: usize = out.iter().map(|m| m.content.len()).sum();
+        assert!(after < before, "compaction did not shrink: {before} -> {after}");
+    }
+
+    #[test]
+    fn compaction_folds_in_the_summaries_rather_than_inventing_them() {
+        // The point of using the Summarizer's own round summaries is that
+        // compaction never puts words in a delegate's mouth.
+        let summaries = vec![
+            "R1: the Advocate argued roses last longer; the Critic disagreed.".into(),
+            "R2: both conceded the stem-length point was unarguable.".into(),
+        ];
+        let (out, what) = compact_history(&history(8), &summaries).expect("compacts");
+        let joined = out.iter().map(|m| &*m.content).collect::<Vec<_>>().join("\n");
+        assert_eq!(what.summaries_used, 2);
+        assert!(!what.clipped_without_summaries);
+        for s in &summaries {
+            assert!(joined.contains(s.as_str()), "a summary went missing: {s}");
+        }
+        // And it says what happened, so the delegate knows its own words are gone.
+        assert!(
+            joined.contains("replaced to fit"),
+            "compaction must be visible to the delegate, not silent"
+        );
+    }
+
+    #[test]
+    fn compaction_falls_back_to_clipping_when_nothing_is_summarised_yet() {
+        // Round one, before the first intermission: there is no summary to
+        // stand in, so the delegate's own early speeches are clipped rather
+        // than deleted. A clipped argument is weaker; a missing one is gone.
+        let (out, what) = compact_history(&history(8), &[]).expect("still compacts");
+        assert!(what.clipped_without_summaries, "this is the no-summary case");
+        assert_eq!(what.summaries_used, 0);
+        assert!(what.dropped_messages > 0);
+        let joined = out.iter().map(|m| &*m.content).collect::<Vec<_>>().join("\n");
+        assert!(
+            joined.contains("SPEECH"),
+            "the seat should still have some of its own words: {joined}"
+        );
+    }
+
+    /// The protected head is protected against *clipping* as well as dropping.
+    ///
+    /// Compaction used to run `clip_for_memory` over every surviving message,
+    /// which is a 400-char head plus 600-char tail cut of the middle. Applied to a
+    /// ~5 kB system prompt that deletes the vote/concede/withdraw block and most of
+    /// the Arbiter's `RULING` — on exactly the turn the model is already under
+    /// pressure, and then persisted for every turn after it. The rules come back
+    /// only when the delegate is re-created, which never happens.
+    #[test]
+    fn compaction_does_not_clip_the_system_prompt_or_the_opening() {
+        let mut h = history(6);
+        h[0] = ChatMessage::system("S".repeat(5000));
+        h[1] = ChatMessage::user("O".repeat(3000));
+        let (out, _) = compact_history(&h, &["R1: summary".into()]).expect("six turns compacts");
+        assert_eq!(
+            out[0].content.len(),
+            5000,
+            "the system prompt must survive compaction byte for byte"
+        );
+        assert!(
+            out.iter().any(|m| m.content == "O".repeat(3000)),
+            "the opening message — the only one carrying the images — must survive intact"
+        );
+        // And the delegate's own speech *is* still shortened, or nothing happened.
+        let own: usize = out
+            .iter()
+            .filter(|m| m.role == "assistant")
+            .map(|m| m.content.chars().count())
+            .sum();
+        let own_before: usize = h
+            .iter()
+            .filter(|m| m.role == "assistant")
+            .map(|m| m.content.chars().count())
+            .sum();
+        assert!(
+            own < own_before,
+            "protecting the head must not have stopped compaction working: {own_before} -> {own}"
+        );
+    }
+
+    /// `normalize_history` folds adjacent replies so the template alternates; that
+    /// fold must not hide turns from compaction.
+    ///
+    /// This is the regression that made `normalize_history` unusable on the
+    /// speaking path. With a folded run the seat's four replies are one message, so
+    /// `COMPACT_KEEP_TURNS` protects all four at once, `droppable` holds a single
+    /// entry, the budget is zero, and a prompt that genuinely does not fit is
+    /// reported as having "nothing left to shorten" and the turn is lost.
+    #[test]
+    fn compaction_can_still_give_up_turns_hidden_inside_a_merged_run() {
+        let mut h = vec![
+            ChatMessage::system("SYSTEM"),
+            ChatMessage::user("OPENING"),
+            ChatMessage::assistant("turn one"),
+            ChatMessage::assistant("turn two"),
+            ChatMessage::assistant("turn three"),
+            ChatMessage::assistant("turn four"),
+            ChatMessage::user("THE BOARD — round 5"),
+        ];
+        normalize_history(&mut h);
+        // Folded: this is the state a third speaking turn actually produces.
+        assert_eq!(
+            h.iter()
+                .filter(|m| m.role == "assistant")
+                .count(),
+            1,
+            "precondition: the four replies really are one message now"
+        );
+
+        let (out, what) = compact_history(&h, &["R1: summary".into()])
+            .expect("four replies behind one message is still four turns to give up");
+        assert!(what.dropped_messages > 0, "nothing was given up: {what:?}");
+        let kept: Vec<&str> = out
+            .iter()
+            .filter(|m| m.role == "assistant")
+            .map(|m| m.content.as_str())
+            .collect();
+        // Survivors are re-folded, so "turn four" can be inside a run with the
+        // one before it. What matters is that it is still there.
+        assert!(
+            kept.iter().any(|k| k.contains("turn four")),
+            "the turn in progress must survive compaction: {kept:?}"
+        );
+        assert!(
+            !kept.iter().any(|k| k.contains("turn one")),
+            "the oldest turn should have been given up: {kept:?}"
+        );
+    }
+
+    #[test]
+    fn compaction_keeps_the_delegates_most_recent_turns() {
+        // The seat is mid-argument in the last exchange. Taking that is how a
+        // delegate ends up contradicting itself.
+        let h = history(10);
+        let (out, _) = compact_history(&h, &["R1: s".into()]).expect("compacts");
+        let joined = out.iter().map(|m| &*m.content).collect::<Vec<_>>().join("\n");
+        assert!(joined.contains("SPEECH 9"), "the newest speech was compacted away");
+        assert!(joined.contains("USER 9"), "the newest exchange was compacted away");
+    }
+
+    #[test]
+    fn compaction_refuses_when_there_is_nothing_to_give_up() {
+        // System, opening, one turn and the brief. The caller turns `None` into
+        // a reported loss, so it must not come back here pretending to have
+        // shortened anything.
+        let h = history(1);
+        assert!(compact_history(&h, &["R1: s".into()]).is_none());
+        assert!(compact_history(&h, &[]).is_none());
+    }
+
+    #[test]
+    fn compaction_never_drops_a_superseded_board_brief() {
+        // Two briefs means one is redundant, and that is free to remove.
+        let mut h = history(4);
+        h.insert(3, ChatMessage::user("THE BOARD\n\n———\n\nROUND 0 — stale."));
+        let (out, _) = compact_history(&h, &["R1: s".into()]).expect("compacts");
+        assert_eq!(
+            out.iter().filter(|m| prompt::is_turn_brief(m)).count(),
+            1,
+            "the stale brief should have been pruned"
+        );
+    }
+
+    #[test]
+    fn round_summaries_are_read_out_of_the_record() {
+        let mut b = Board::new(DebateConfig::default());
+        push_entry(&mut b, "a", 1, "ROUND 1 SUMMARY: roses are red");
+        push_entry(&mut b, "a", 1, "raised P1");
+        // A second delegate writing a round-1 summary is deduped: only one
+        // summariser runs per round, and promoting both would stack a
+        // near-identical stand-in into the prompt being shortened.
+        push_entry(&mut b, "b", 1, "ROUND 1 SUMMARY: violets are not roses");
+        push_entry(&mut b, "a", 2, "ROUND 2 SUMMARY: both gave ground");
+        let got = round_summaries(&b);
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(got[0].contains("roses are red"));
+        assert!(got[1].contains("both gave ground"));
+        // The non-summary entry between them is not mistaken for one.
+        assert!(!got.iter().any(|s| s.contains("raised P1")), "{got:?}");
+    }
+
+    #[test]
+    fn one_summary_per_round_however_many_the_intermission_wrote() {
+        // A long intermission can write more than once; promoting every one
+        // would stack near-identical stand-ins into the prompt we are trying to
+        // shorten.
+        let mut b = Board::new(DebateConfig::default());
+        push_entry(&mut b, "a", 1, "ROUND 1 SUMMARY: first pass");
+        push_entry(&mut b, "a", 1, "ROUND 1 SUMMARY: second pass");
+        assert_eq!(round_summaries(&b).len(), 1);
+    }
+
+    #[test]
+    fn a_malformed_summary_line_is_not_mistaken_for_one() {
+        let mut b = Board::new(DebateConfig::default());
+        push_entry(&mut b, "a", 1, "ROUND 1 was contested");
+        push_entry(&mut b, "a", 9, "ROUND x SUMMARY: nonsense round");
+        push_entry(&mut b, "a", 2, "ROUND 2 SUMMARY:    ");
+        assert!(round_summaries(&b).is_empty(), "{:?}", round_summaries(&b));
+    }
+
+    /// `tail_clip` keeps byte-identical output to the `while … nth(…)` loop it
+    /// replaces — including the loop's off-by-one (the last `budget - 1`
+    /// chars) — and never splits a multibyte char.
+    #[test]
+    fn tail_clip_matches_the_old_loop_on_multibyte_input() {
+        fn old(s: &str, budget: usize) -> String {
+            let mut s = s.to_string();
+            while s.chars().count() > budget {
+                let cut = s
+                    .char_indices()
+                    .nth(s.chars().count() - budget + 1)
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                s = s[cut..].to_string();
+            }
+            s
+        }
+        // Emoji (4 bytes) up front so any byte-based cut would split one.
+        let s = format!("{}{}", "🎉".repeat(100), "x".repeat(3000));
+        for budget in [10, 500, 2_999, 3_000, 3_099, 5_000] {
+            let got = tail_clip(s.clone(), budget);
+            assert_eq!(got, old(&s, budget), "budget {budget}");
+            assert!(
+                !got.contains('�'),
+                "a split char at budget {budget}: {got:?}"
+            );
+            // The cut lands on a boundary by construction: empty, whole, and
+            // the first/last byte positions always are.
+            assert!(got.is_char_boundary(0));
+            assert!(got.is_char_boundary(got.len()));
+        }
+        // CJK tail: the kept end must be whole characters too.
+        let cjk = format!("{}{}", "y".repeat(2990), "漢".repeat(100));
+        let got = tail_clip(cjk.clone(), 3_000);
+        assert_eq!(got, old(&cjk, 3_000));
+        // Byte fast paths: ASCII within budget, and multibyte input that fits
+        // by chars but not by bytes, both come back untouched.
+        assert_eq!(tail_clip("abc".to_string(), 10), "abc");
+        let emoji = "🎉".repeat(5);
+        assert_eq!(tail_clip(emoji.clone(), 5), emoji);
+    }
+
+    /// `clip_for_memory` on multibyte input: same head, tail and count as the
+    /// old `Vec<char>` spelling, and no split characters.
+    #[test]
+    fn clip_for_memory_never_splits_multibyte_input() {
+        let text = format!("{}{}{}", "🎉".repeat(500), "x".repeat(500), "漢".repeat(500));
+        assert!(text.chars().count() > HISTORY_HEAD + HISTORY_TAIL + 40);
+        let got = clip_for_memory(&text);
+        let chars: Vec<char> = text.chars().collect();
+        let keep = HISTORY_HEAD + HISTORY_TAIL;
+        let head: String = chars[..HISTORY_HEAD].iter().collect();
+        let tail: String = chars[chars.len() - HISTORY_TAIL..].iter().collect();
+        let expected = format!(
+            "{head}\n[...{} characters of this turn are in the transcript but not \
+             here...]\n{tail}",
+            chars.len() - keep
+        );
+        assert_eq!(got, expected);
+        assert_eq!(got.as_bytes(), expected.as_bytes(), "byte output must match");
+        assert!(!got.contains('�'), "a char was split: {got:?}");
+        // Short input is returned as-is, including multibyte.
+        let short = "héllo 🎉 漢字";
+        assert_eq!(clip_for_memory(short), short);
+    }
+
+    /// Image payloads leave the stored history once the seat's turn is
+    /// accepted; text, roles and order are untouched.
+    #[test]
+    fn sent_images_are_stripped_from_stored_history() {
+        let mut history = vec![ChatMessage::system("s")];
+        let mut opening = ChatMessage::user("opening");
+        opening.images = vec![
+            "data:image/png;base64,AAA".into(),
+            "data:image/jpeg;base64,BBB".into(),
+        ];
+        history.push(opening);
+        history.push(ChatMessage::assistant("speech"));
+        strip_sent_images(&mut history);
+        assert!(history.iter().all(|m| m.images.is_empty()));
+        assert_eq!(history[0].content, "s");
+        assert_eq!(history[1].content, "opening");
+        assert_eq!(history[2].content, "speech");
+    }
+
+    /// The cached board snapshot and ballot context match the fresh renderings
+    /// for identical inputs, and refresh when the board or the record moves.
+    #[test]
+    fn cached_prompts_match_fresh_ones() {
+        fn point(id: u32, text: &str) -> Point {
+            Point {
+                id,
+                text: text.into(),
+                raised_by: "a".into(),
+                round: 1,
+                withdrawn: false,
+                withdrawn_reason: None,
+                beats: vec![],
+                votes: Default::default(),
+                rebuttals: vec![],
+                steelmen: vec![],
+                evidence: vec![],
+                conceded_by: Default::default(),
+                review: None,
+                ruling: None,
+            }
+        }
+        let mut b = Board::new(DebateConfig::default());
+        b.points.push(point(1, "roses last longer than lilies 🌹"));
+        b.touch_points();
+        push_entry(&mut b, "a", 1, "raised P1");
+
+        let fresh_board = prompt::board_snapshot(&b.points, &b.config.delegates);
+        assert_eq!(b.board_snapshot_cached(), fresh_board);
+        assert_eq!(
+            b.board_snapshot_cached(),
+            fresh_board,
+            "the cache hit must match too"
+        );
+        let fresh_ctx =
+            Engine::<crate::client::HttpBackend>::ballot_context(&b);
+        assert_eq!(b.ballot_context_cached(), fresh_ctx);
+        assert_eq!(
+            b.ballot_context_cached(),
+            fresh_ctx,
+            "the context cache hit must match too"
+        );
+
+        // A vote lands: the version bumps, the cache refreshes, and both
+        // spellings still agree.
+        b.points[0].votes.insert(
+            "b".into(),
+            VoteRecord {
+                delegate: "b".into(),
+                verdict: Verdict::Win,
+                reason: Some("convinced 🌹".into()),
+                round: 1,
+            },
+        );
+        b.touch_points();
+        push_entry(&mut b, "b", 1, "voted P1 win");
+        assert_eq!(
+            b.board_snapshot_cached(),
+            prompt::board_snapshot(&b.points, &b.config.delegates)
+        );
+        assert_eq!(
+            b.ballot_context_cached(),
+            Engine::<crate::client::HttpBackend>::ballot_context(&b)
+        );
     }
 }
 
@@ -5062,7 +6827,40 @@ fn validate(cfg: &DebateConfig) -> Result<(), String> {
             ));
         }
     }
+    // Ids, not just labels. `Point::tally` counts per *roster entry*, so a duplicate
+    // id double-counts one seat's vote in every tally while `Tally.ratings` — a map —
+    // de-duplicates it: the two disagree, the score is inflated, and a carried point
+    // can flip to a stalemate on the strength of a single seat. `voting_ids()` also
+    // yields the id twice, so every ballot asks the same seat twice in one round and
+    // the poll counts both answers.
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     for d in &cfg.delegates {
+        if !seen_ids.insert(d.id.to_ascii_lowercase()) {
+            return Err(format!(
+                "two seats share the id {} — ids have to be unique for votes to be \
+                 counted once",
+                d.id
+            ));
+        }
+    }
+    for d in &cfg.delegates {
+        if d.human {
+            // The operator is the model, so neither is needed — but only
+            // arguing seats can be taken. Judging and summarizing stay with
+            // the models, because a human Arbiter ruling on their own
+            // argument is not adjudication and a human Summarizer writing the
+            // verdict they argued for is not a record.
+            match d.seat_role {
+                SeatRole::Proponent | SeatRole::Opponent | SeatRole::Rationale | SeatRole::Custom => {}
+                _ => {
+                    return Err(format!(
+                        "{} holds a seat the models keep — only arguing seats can be taken",
+                        d.label
+                    ))
+                }
+            }
+            continue;
+        }
         if d.model.trim().is_empty() {
             return Err(format!("{} has no model selected", d.label));
         }
@@ -5086,4 +6884,8 @@ pub struct Snapshot {
     pub polls: Vec<Poll>,
     pub speeches: Vec<Speech>,
     pub finished: bool,
+    /// What the operator is being asked, if this debate is parked on them. A
+    /// reload during a taken turn used to show an empty chamber with the
+    /// debate still running behind it.
+    pub pending: Option<PendingPrompt>,
 }

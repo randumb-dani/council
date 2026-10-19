@@ -1,11 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
-import {
-  ArrowRight,
-  CalendarBlank,
-  Scales,
-  SpinnerGap,
-  Trash,
-} from "@phosphor-icons/react";
+import { ArrowRight } from "@phosphor-icons/react/dist/csr/ArrowRight";
+import { CalendarBlank } from "@phosphor-icons/react/dist/csr/CalendarBlank";
+import { SpinnerGap } from "@phosphor-icons/react/dist/csr/SpinnerGap";
+import { Trash } from "@phosphor-icons/react/dist/csr/Trash";
+import { User } from "@phosphor-icons/react/dist/csr/User";
 import {
   deleteDebate,
   listDebates,
@@ -13,7 +11,10 @@ import {
   slug,
   type SavedDebate,
 } from "../debates";
-
+import { ThemePicker } from "./ThemePicker";
+import { Wordmark } from "./Wordmark";
+import { debateState } from "../bridge";
+import type { ThemeId } from "../themes";
 function when(ms: number): string {
   const d = new Date(ms);
   const today = new Date();
@@ -25,7 +26,6 @@ function when(ms: number): string {
     ? `today ${d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}`
     : d.toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
 }
-
 /**
  * The front door: what has been said, and the one button that starts something.
  *
@@ -36,21 +36,56 @@ function when(ms: number): string {
 export function HomeView({
   onConvene,
   onOpen,
+  onReturn,
+  onTakeSeat,
   theme,
-  onToggleTheme,
+  onTheme,
 }: {
   onConvene: () => void;
   onOpen: (id: string) => void;
-  theme: "dark" | "light";
-  onToggleTheme: () => void;
+  /** Back to the chamber while a council is in session. */
+  onReturn: () => void;
+  /** Into the council where the operator argues a seat themselves. */
+  onTakeSeat: () => void;
+  theme: ThemeId;
+  onTheme: (id: ThemeId) => void;
 }) {
   const [debates, setDebates] = useState<SavedDebate[] | null>(null);
   const [confirming, setConfirming] = useState<string | null>(null);
+  // A council outlives the chamber view: the engine keeps running while the
+  // library is on screen, and remounting the chamber re-adopts it from the
+  // snapshot. Without this card the only way back was knowing the `#/new`
+  // hash, while the convene button invited starting a second debate on top.
+  const [live, setLive] = useState<{ motion: string; round: number } | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    const check = () => {
+      debateState()
+        .then((snap) => {
+          if (cancelled) return;
+          setLive(
+            snap && !snap.finished && (snap.points.length || snap.speeches.length)
+              ? { motion: snap.motion, round: snap.round }
+              : null,
+          );
+        })
+        .catch(() => {
+          if (!cancelled) setLive(null);
+        });
+    };
+    check();
+    // Debates save as they run, so a council convened after this mount shows
+    // up without a reload.
+    window.addEventListener("council:library", check);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("council:library", check);
+    };
+  }, []);
   // A failed export used to be indistinguishable from a dead button, which is
   // the one thing you cannot afford on the action that gets a debate off the
   // machine.
   const [exportError, setExportError] = useState<string | null>(null);
-
   // Read on mount and whenever the window says the store changed, so returning
   // from a debate shows it in the list rather than only after a reload.
   useEffect(() => {
@@ -63,40 +98,77 @@ export function HomeView({
       window.removeEventListener("storage", read);
     };
   }, []);
-
   const saved = useMemo(() => debates ?? [], [debates]);
-
+  // Constant 20, mirroring MAX_KEPT=20 in debates.ts. `libraryCapacity().max`
+  // parses the whole library just to return that constant, so call it never;
+  // update this if MAX_KEPT changes (libraryCapacity max is the source of truth).
+  const libraryMax = 20;
   return (
     <div className="flex h-full flex-col overflow-y-auto">
-      <header className="flex h-[52px] shrink-0 items-center gap-4 border-b border-line bg-surface px-4">
-        <div className="flex items-center gap-2 text-[11px] font-bold tracking-[0.16em] text-ink">
-          <span className="flex size-5 items-center justify-center rounded-md bg-primary text-on-primary">
-            <Scales size={13} weight="bold" />
-          </span>
-          COUNCIL
-        </div>
+      {/* Wraps, for the same reason the chamber header does.
+            This row came to ~500px — wordmark, theme picker, and two calls to
+            action with long labels — inside `overflow-y-auto` under a `body` with
+            `overflow: hidden`. At 430px the overflow was clipped rather than
+            scrolled, so the arrow and the tail of "convene a council" were simply
+            gone. The front door's only two calls to action, cut off by the
+            width of the window. */}
+      <header className="flex min-h-[52px] shrink-0 flex-wrap items-center gap-x-4 gap-y-1 border-b border-line bg-surface px-4 py-1">
+        <Wordmark />
         <div className="flex-1" />
+        <ThemePicker value={theme} onChange={onTheme} />
+        {/* Two councils, two buttons: the automatic one, and the one where you
+            argue a seat yourself. They are different debates, not different
+            settings — the engine waits for you in one and never in the other. */}
         <button
           type="button"
-          className="btn btn-ghost !w-8 !px-0"
-          onClick={onToggleTheme}
-          title={theme === "dark" ? "switch to light" : "switch to dark"}
-          aria-label="toggle theme"
+          className="btn"
+          onClick={onTakeSeat}
+          title="Argue one of the debating roles yourself — the council waits for you"
         >
-          {theme === "dark" ? <MoonIcon /> : <SunIcon />}
+          <User size={14} /> take a seat
         </button>
         <button type="button" className="btn btn-primary" onClick={onConvene}>
           convene a council <ArrowRight size={14} />
         </button>
       </header>
-
       <main className="mx-auto w-full max-w-3xl px-5 py-8">
         <h1 className="text-[19px] font-semibold tracking-tight text-ink">The library</h1>
         <p className="mt-1 text-[12.5px] leading-relaxed text-ink-3">
           Every debate is kept here as it runs, so nothing is lost when the window
           closes. Open one to read it, or take it away as Markdown or JSON.
         </p>
-
+        {/* The trim, stated.
+            The library sheds its oldest debate past twenty, silently: no notice,
+            no count, nothing on the card. An operator accumulating debates over a
+            week lost the oldest one with no signal and no way of knowing it had
+            ever been there — and this module's whole reason for existing is
+            against exactly that. Reaching the cap is ordinary, so this is a quiet
+            line rather than a warning; but it is there. */}
+        {saved.length > 0 && (
+          <p className="mt-2 text-[11.5px] leading-relaxed text-ink-3">
+            Keeping the {saved.length} newest, up to {libraryMax}. Anything older is
+            dropped — take what you want to keep as Markdown or JSON.
+          </p>
+        )}
+        {live && (
+          <button
+            type="button"
+            onClick={onReturn}
+            className="rise mt-4 flex w-full items-center gap-3 rounded-xl border border-primary/50 bg-primary-soft px-4 py-3 text-left"
+            title="Back to the council currently in session"
+          >
+            <span className="size-2 shrink-0 rounded-full bg-primary live-dot" aria-hidden />
+            <span className="min-w-0 flex-1">
+              <span className="block text-[12px] font-semibold text-ink">
+                A council is in session — return to it
+              </span>
+              <span className="block truncate text-[12px] text-ink-2">
+                round {live.round} · {live.motion || "no motion set"}
+              </span>
+            </span>
+            <ArrowRight size={14} className="shrink-0 text-ink-2" />
+          </button>
+        )}
         {debates === null ? (
           <div className="mt-10 flex items-center justify-center gap-2 text-ink-3">
             <SpinnerGap size={15} className="animate-spin" /> reading the library…
@@ -145,7 +217,6 @@ export function HomeView({
     </div>
   );
 }
-
 function DebateCard({
   onExported,
   debate,
@@ -189,7 +260,7 @@ function DebateCard({
             {s.unfinished && (
               <span
                 className="status-pill ml-auto bg-primary-soft text-primary"
-                title="no verdict was reached — the debate was still running or was stopped"
+                title="This debate never reached an answer — it was still running when you left, or you stopped it"
               >
                 unfinished
               </span>
@@ -223,7 +294,6 @@ function DebateCard({
             </p>
           )}
         </button>
-
         <div className="flex shrink-0 flex-col items-end gap-1.5">
           <button type="button" className="btn" onClick={onOpen}>
             read
@@ -277,20 +347,5 @@ function DebateCard({
         </div>
       </div>
     </li>
-  );
-}
-
-function MoonIcon() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden>
-      <path d="M6 1a.75.75 0 0 1 .26 1.46 5.5 5.5 0 0 0 5.28 6.86.75.75 0 0 1 1.02.9 7 7 0 1 1-7.5-7.5.75.75 0 0 1 .94-1.72Z" />
-    </svg>
-  );
-}
-function SunIcon() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden>
-      <path d="M8 4a4 4 0 1 0 0 8 4 4 0 0 0 0-8Zm0 1.5a2.5 2.5 0 1 1 0 5 2.5 2.5 0 0 1 0-5ZM7 0h2v2.5H7V0Zm0 13.5h2V16H7v-2.5ZM0 7h2.5v2H0V7Zm13.5 0H16v2h-2.5V7Z" />
-    </svg>
   );
 }

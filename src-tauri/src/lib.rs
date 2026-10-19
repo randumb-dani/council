@@ -4,15 +4,15 @@
 
 use council_core::engine::{Engine, Snapshot};
 use council_core::events::EngineEvent;
-use council_core::types::{DebateConfig, EndpointConfig};
-use council_core::HttpBackend;
+use council_core::types::{DebateConfig, EndpointConfig, HumanBallot, HumanTurnSubmit};
+use council_core::ProviderBackend;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 /// Every event the engine emits arrives in the webview on this channel.
 pub const EVENT_CHANNEL: &str = "council://event";
 
-type Council = Arc<Engine<HttpBackend>>;
+type Council = Arc<Engine<ProviderBackend>>;
 
 #[tauri::command]
 fn start_debate(engine: State<'_, Council>, config: DebateConfig) -> Result<(), String> {
@@ -56,6 +56,21 @@ fn debate_state(engine: State<'_, Council>) -> Snapshot {
     engine.snapshot()
 }
 
+/// Answer a taken seat's turn. Validated by the engine, and a refusal comes
+/// back as an error the webview shows inline — so a mistyped action is fixable
+/// rather than lost, which is the whole difference between a taken seat and a
+/// silent one.
+#[tauri::command]
+fn submit_turn(engine: State<'_, Council>, submit: HumanTurnSubmit) -> Result<(), String> {
+    engine.submit_turn(submit)
+}
+
+/// Answer a ballot on the operator's own seat.
+#[tauri::command]
+fn submit_ballot(engine: State<'_, Council>, ballot: HumanBallot) -> Result<(), String> {
+    engine.submit_ballot(ballot)
+}
+
 /// Probe an endpoint. Returns the models it serves, or the real reason it could
 /// not be reached — this is the first thing anyone tries when nothing works, so
 /// the error has to be actionable.
@@ -83,7 +98,7 @@ pub fn run() {
                 // useful to do about it mid-debate.
                 let _ = handle.emit(EVENT_CHANNEL, &event);
             };
-            let engine: Council = Arc::new(Engine::new(HttpBackend::new(), Arc::new(sink)));
+            let engine: Council = Arc::new(Engine::new(ProviderBackend::new(), Arc::new(sink)));
             app.manage(engine);
             Ok(())
         })
@@ -94,7 +109,9 @@ pub fn run() {
             inject_note,
             resolve_extension,
             debate_state,
-            list_models
+            list_models,
+            submit_turn,
+            submit_ballot
         ])
         .run(tauri::generate_context!())
         .expect("error while running council");

@@ -1,14 +1,31 @@
+@import "./fonts.css";
 @import "tailwindcss";
 
-/* Toggled from the top bar; dark is the default. */
-@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
-
 /*
-  One tonal ladder, two themes. Light values live on :root and dark overrides
-  them on [data-theme="dark"], so every utility below follows the toggle
-  without a single dark: prefix.
+  One tonal ladder, eight themes.
+
+  `:root` carries sage-light, and each `[data-theme="…"]` block overrides the
+  whole set. Nothing below uses a `dark:` prefix, so a theme is a value change
+  and nothing more.
+
+  Two rules keep this from rotting:
+
+  - **Every theme defines every token.** Custom properties inherit, so a theme
+    that omits `--warn` does not fail — it silently keeps the previous theme's
+    warn. `themes.test.ts` asserts the full set per theme for exactly that
+    reason.
+  - **Colour literals live in the theme blocks only.** Everything downstream
+    reads `var(--…)`, which is what lets a new theme exist without touching a
+    component.
+
+  Seat identity is the one deliberate exception: `--seat-1` … `--seat-12` are
+  defined by every theme but the two sages, and components read
+  `var(--seat-3, <the seat's own colour>)`. The fallback is the seat's stored
+  colour, so the sage themes keep their per-seat hues with no theme
+  awareness in any component, and the ramp themes override them.
 */
-:root {
+:root,
+[data-theme="sage-light"] {
   color-scheme: light;
   --canvas: #e7f3f0;
   --surface: #f7fcfb;
@@ -31,9 +48,16 @@
   --shadow-1: 0 1px 2px rgb(20 24 30 / 0.06), 0 4px 16px -4px rgb(20 24 30 / 0.1);
   --shadow-pop: 0 8px 32px -8px rgb(20 24 30 / 0.22);
   --glow: 0 0 0 1px rgb(26 115 232 / 0.35), 0 4px 20px -2px rgb(26 115 232 / 0.45);
+  --ambient-1: transparent;
+  --ambient-2: transparent;
+  --bar-leader-a: rgb(26 115 232 / 0.25);
+  --bar-leader-b: rgb(26 115 232 / 0.45);
+  --avatar-ink: #06110f;
+  --avatar-ink-invert: #f2faf9;
+  --chevron-svg: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%235c6664' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E");
 }
 
-[data-theme="dark"] {
+[data-theme="sage-dark"] {
   color-scheme: dark;
   --canvas: #0a1514;
   --surface: #0f1f1d;
@@ -56,6 +80,456 @@
   --shadow-1: 0 1px 2px rgb(0 0 0 / 0.4), 0 6px 24px -8px rgb(0 0 0 / 0.5);
   --shadow-pop: 0 12px 44px -10px rgb(0 0 0 / 0.65);
   --glow: 0 0 0 1px rgb(168 199 250 / 0.4), 0 4px 24px -2px rgb(168 199 250 / 0.35);
+  --ambient-1: rgb(168 199 250 / 0.055);
+  --ambient-2: rgb(129 201 149 / 0.04);
+  --bar-leader-a: rgb(168 199 250 / 0.18);
+  --bar-leader-b: rgb(168 199 250 / 0.38);
+  --avatar-ink: #06110f;
+  --avatar-ink-invert: #f2faf9;
+  --chevron-svg: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%239aa0a6' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E");
+}
+
+/* Amber: the sage ladder with the hue rotated round to warm. */
+[data-theme="orange"] {
+  color-scheme: dark;
+  --canvas: #17110b;
+  --surface: #211810;
+  --surface-2: #2f2318;
+  --surface-3: #3d2d1e;
+  --line: #5b452c;
+  --line-2: #7d5f3c;
+  --ink: #f7ede1;
+  --ink-2: #d4bda6;
+  --ink-3: #b39a80;
+  --primary: #f0a868;
+  --primary-hover: #f7bd88;
+  --on-primary: #2a1a0c;
+  --primary-soft: #3a2818;
+  --ok: #94cf7c;
+  --warn: #f5cf5a;
+  --bad: #f08d7d;
+  --bad-soft: #331913;
+  --focus: #f0a868;
+  --shadow-1: 0 1px 2px rgb(0 0 0 / 0.45), 0 6px 24px -8px rgb(0 0 0 / 0.55);
+  --shadow-pop: 0 12px 44px -10px rgb(0 0 0 / 0.7);
+  --glow: 0 0 0 1px rgb(240 168 104 / 0.4), 0 4px 24px -2px rgb(240 168 104 / 0.3);
+  --ambient-1: rgb(240 168 104 / 0.05);
+  --ambient-2: rgb(148 207 124 / 0.035);
+  --bar-leader-a: rgb(240 168 104 / 0.2);
+  --bar-leader-b: rgb(240 168 104 / 0.42);
+  --avatar-ink: #2a1a0c;
+  --avatar-ink-invert: #f7ede1;
+  --chevron-svg: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23b3a394' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E");
+  /* Seat ramp: the teals, rotated warm. Defined here rather than left to the
+     stored colours because a teal disc on an amber board is the one thing
+     that would give the theme away. Slot 1 is the theme's own primary, which
+     is the arrangement the sage themes get for free (Advocate is exactly
+     --primary). Twelve steps, separated in OKLab rather than by eye — the
+     closest pair is 0.074 apart, and every one clears 2.8:1 on this canvas so
+     none of them vanishes against it. */
+  --seat-1: #f0a868;
+  --seat-2: #ae2d31;
+  --seat-3: #a87e24;
+  --seat-4: #e6625f;
+  --seat-5: #8f5200;
+  --seat-6: #e87f0c;
+  --seat-7: #c55200;
+  --seat-8: #fe8b85;
+  --seat-9: #ffc75a;
+  --seat-10: #c89d48;
+  --seat-11: #ae5653;
+  --seat-12: #c5744d;
+  /* Glyph ink, per step. Required because the glyph sits on the *ramp* colour,
+     which JS cannot resolve — `inkOn` in seats.ts works from the seat's stored
+     teal, and that picks the wrong side of the threshold on four of these steps.
+     Each entry is whichever of the two inks actually wins on that step. Note the
+     floor is 3.96:1 (step 7), not 4.5:1: a saturated mid-tone orange is the one
+     colour where neither near-black nor cream separates well, and this is a
+     single decorative glyph well inside the 3:1 large-text bar. */
+  --seat-ink-1: #2a1a0c;
+  --seat-ink-2: #f7ede1;
+  --seat-ink-3: #2a1a0c;
+  --seat-ink-4: #2a1a0c;
+  --seat-ink-5: #f7ede1;
+  --seat-ink-6: #2a1a0c;
+  --seat-ink-7: #f7ede1;
+  --seat-ink-8: #2a1a0c;
+  --seat-ink-9: #2a1a0c;
+  --seat-ink-10: #2a1a0c;
+  --seat-ink-11: #f7ede1;
+  --seat-ink-12: #2a1a0c;
+}
+
+/* Amber light: the same warm ladder on a pale background.
+   Dark text on cream needs the accent darkened rather than lightened — the
+   dark theme's #f0a868 would wash out here, so the primary is a deep amber
+   that still reads as amber next to it. Verdicts follow the same treatment as
+   the dark side: green / amber / rose, all clearing 4.5:1 as text. */
+[data-theme="orange-light"] {
+  color-scheme: light;
+  --canvas: #ece1cd;
+  --surface: #faf4e8;
+  --surface-2: #e6d5b8;
+  --surface-3: #d6bf97;
+  --line: #d2bd97;
+  --line-2: #a68c60;
+  --ink: #2a1a0c;
+  --ink-2: #5f4a30;
+  --ink-3: #8a7355;
+  --primary: #9a5a08;
+  --primary-hover: #7d4706;
+  --on-primary: #faf5ec;
+  --primary-soft: #eed9b8;
+  --ok: #146636;
+  --warn: #6f5600;
+  --bad: #b0211b;
+  --bad-soft: #fae7e1;
+  --focus: #9a5a08;
+  --shadow-1: 0 1px 2px rgb(20 24 30 / 0.06), 0 4px 16px -4px rgb(20 24 30 / 0.1);
+  --shadow-pop: 0 8px 32px -8px rgb(20 24 30 / 0.22);
+  --glow: 0 0 0 1px rgb(154 90 8 / 0.35), 0 4px 20px -2px rgb(154 90 8 / 0.3);
+  --ambient-1: transparent;
+  --ambient-2: transparent;
+  --bar-leader-a: rgb(154 90 8 / 0.22);
+  --bar-leader-b: rgb(154 90 8 / 0.45);
+  --avatar-ink: #2a1a0c;
+  --avatar-ink-invert: #faf5ec;
+  --chevron-svg: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%238a7355' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E");
+  /* Seat ramp: the ambers, darkened for cream. Same reasoning as the dark
+     side — a teal disc on an amber board gives the theme away — but the steps
+     run dark to mid rather than mid to light, because on a pale canvas it is
+     the dark end that separates. Every step clears 2.5:1 on this canvas. */
+  --seat-1: #7a4a08;
+  --seat-2: #7f4f0c;
+  --seat-3: #85530f;
+  --seat-4: #8a5813;
+  --seat-5: #905d17;
+  --seat-6: #95621a;
+  --seat-7: #9b661e;
+  --seat-8: #a06b21;
+  --seat-9: #a67025;
+  --seat-10: #ab7529;
+  --seat-11: #b1792c;
+  --seat-12: #b67e30;
+  /* Glyph ink, per step — the crossover sits between steps 8 and 9, where
+     dark ink first loses. Every step clears 3:1. */
+  --seat-ink-1: #faf5ec;
+  --seat-ink-2: #faf5ec;
+  --seat-ink-3: #faf5ec;
+  --seat-ink-4: #faf5ec;
+  --seat-ink-5: #faf5ec;
+  --seat-ink-6: #faf5ec;
+  --seat-ink-7: #faf5ec;
+  --seat-ink-8: #faf5ec;
+  --seat-ink-9: #2a1a0c;
+  --seat-ink-10: #2a1a0c;
+  --seat-ink-11: #2a1a0c;
+  --seat-ink-12: #2a1a0c;
+}
+
+/*
+  Slate: Graphite's shape with colour in it. The surfaces are blue-tinted
+  greys rather than neutral ones, the accent is a single restrained
+  steel-blue, and the seat ramp runs desaturated slate-blues instead of pure
+  greys — told apart by lightness first, hue second, so it stays readable for
+  anyone who cannot see the blue at all.
+*/
+[data-theme="slate"] {
+  color-scheme: dark;
+  --canvas: #12161c;
+  --surface: #1a212b;
+  --surface-2: #232d3a;
+  --surface-3: #2e3a4b;
+  --line: #3a4a5e;
+  --line-2: #55697f;
+  --ink: #e8eef4;
+  --ink-2: #a9b8c7;
+  --ink-3: #7e8fa1;
+  --primary: #7fb0d8;
+  --primary-hover: #9cc4e2;
+  --on-primary: #0c141b;
+  --primary-soft: #1d2f42;
+  --ok: #7fc795;
+  --warn: #e0b45c;
+  --bad: #e08e8e;
+  --bad-soft: #2a1a1e;
+  --focus: #7fb0d8;
+  --shadow-1: 0 1px 2px rgb(0 0 0 / 0.4), 0 6px 24px -8px rgb(0 0 0 / 0.5);
+  --shadow-pop: 0 12px 44px -10px rgb(0 0 0 / 0.65);
+  --glow: 0 0 0 1px rgb(127 176 216 / 0.35), 0 4px 20px -2px rgb(127 176 216 / 0.25);
+  --ambient-1: rgb(127 176 216 / 0.07);
+  --ambient-2: transparent;
+  --bar-leader-a: rgb(127 176 216 / 0.22);
+  --bar-leader-b: rgb(127 176 216 / 0.45);
+  --avatar-ink: #0a1118;
+  --avatar-ink-invert: #f2f7fb;
+  --chevron-svg: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%237e8fa1' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E");
+  /* Seat ramp: twelve slate-blues, lightest first, linear in RGB between two
+     endpoints rather than stepped by eye. The hue is deliberately weak — the
+     steps still separate by lightness, which is what carries them for anyone
+     who cannot see blue. Darkest step 3.19:1 on this canvas, so the floor has
+     more headroom than Graphite's 2.60:1. */
+  --seat-1: #d9e5f1;
+  --seat-2: #cdd9e6;
+  --seat-3: #c1cedb;
+  --seat-4: #b5c2d1;
+  --seat-5: #aab7c6;
+  --seat-6: #9eacbb;
+  --seat-7: #92a0b1;
+  --seat-8: #8695a6;
+  --seat-9: #7b8a9b;
+  --seat-10: #6f7e91;
+  --seat-11: #637386;
+  --seat-12: #58687c;
+  /* Glyph ink, per step — the crossover sits between steps 10 and 11, where
+     light ink first wins. Every step clears 4.5:1. */
+  --seat-ink-1: #0a1118;
+  --seat-ink-2: #0a1118;
+  --seat-ink-3: #0a1118;
+  --seat-ink-4: #0a1118;
+  --seat-ink-5: #0a1118;
+  --seat-ink-6: #0a1118;
+  --seat-ink-7: #0a1118;
+  --seat-ink-8: #0a1118;
+  --seat-ink-9: #0a1118;
+  --seat-ink-10: #0a1118;
+  --seat-ink-11: #f2f7fb;
+  --seat-ink-12: #f2f7fb;
+}
+
+/* Slate light: the steel-blue ladder on a pale background.
+   Same shape as the dark side — blue-tinted greys, one restrained accent —
+   with the ramp running dark to mid for the same reason as Amber light. The
+   accent is a deep steel blue rather than the dark side's pale one. */
+[data-theme="slate-light"] {
+  color-scheme: light;
+  --canvas: #e3e9f1;
+  --surface: #f3f6fb;
+  --surface-2: #d8e1ec;
+  --surface-3: #bfcedf;
+  --line: #bac8d8;
+  --line-2: #8ba1b8;
+  --ink: #0f1b29;
+  --ink-2: #3a5369;
+  --ink-3: #647b91;
+  --primary: #2f6da3;
+  --primary-hover: #235682;
+  --on-primary: #f2f7fc;
+  --primary-soft: #c9ddef;
+  --ok: #14723f;
+  --warn: #875600;
+  --bad: #bf231e;
+  --bad-soft: #fbe9e7;
+  --focus: #2f6da3;
+  --shadow-1: 0 1px 2px rgb(20 24 30 / 0.06), 0 4px 16px -4px rgb(20 24 30 / 0.1);
+  --shadow-pop: 0 8px 32px -8px rgb(20 24 30 / 0.22);
+  --glow: 0 0 0 1px rgb(47 109 163 / 0.35), 0 4px 20px -2px rgb(47 109 163 / 0.3);
+  --ambient-1: transparent;
+  --ambient-2: transparent;
+  --bar-leader-a: rgb(47 109 163 / 0.22);
+  --bar-leader-b: rgb(47 109 163 / 0.45);
+  --avatar-ink: #0a141f;
+  --avatar-ink-invert: #f2f7fc;
+  --chevron-svg: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23647b91' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E");
+  /* Seat ramp: twelve slate-blues, darkest first, linear in RGB like the dark
+     side — but compressed toward the dark end, because on a pale canvas it is
+     darkness that separates. Darkest step 2.70:1, so the floor holds with less
+     headroom than the dark side's 3.19:1, and that is stated here rather than
+     discovered later. */
+  --seat-1: #33506a;
+  --seat-2: #39566f;
+  --seat-3: #405c75;
+  --seat-4: #46617a;
+  --seat-5: #4d6780;
+  --seat-6: #536d85;
+  --seat-7: #5a738b;
+  --seat-8: #607990;
+  --seat-9: #677f96;
+  --seat-10: #6d849b;
+  --seat-11: #748aa1;
+  --seat-12: #7a90a6;
+  /* Glyph ink, per step — the crossover sits between steps 8 and 9. */
+  --seat-ink-1: #f2f7fc;
+  --seat-ink-2: #f2f7fc;
+  --seat-ink-3: #f2f7fc;
+  --seat-ink-4: #f2f7fc;
+  --seat-ink-5: #f2f7fc;
+  --seat-ink-6: #f2f7fc;
+  --seat-ink-7: #f2f7fc;
+  --seat-ink-8: #f2f7fc;
+  --seat-ink-9: #0a141f;
+  --seat-ink-10: #0a141f;
+  --seat-ink-11: #0a141f;
+  --seat-ink-12: #0a141f;
+}
+
+
+/*
+  Graphite: no hue in the chrome. Everything the coloured themes separate by
+  hue, this separates by lightness in its surfaces and seat ramp — but win /
+  lose / stalemate keep a muted green / amber / rose, because three greys could
+  not carry that distinction (see the note on the tokens themselves).
+*/
+[data-theme="grey"] {
+  color-scheme: dark;
+  --canvas: #161718;
+  --surface: #1e1f21;
+  --surface-2: #28292c;
+  --surface-3: #34363a;
+  --line: #45474b;
+  --line-2: #5f6266;
+  --ink: #e9eaec;
+  --ink-2: #b8bbbf;
+  --ink-3: #96999e;
+  --primary: #d7d9dc;
+  --primary-hover: #e9eaec;
+  --on-primary: #161718;
+  --primary-soft: #2e3034;
+  /* Semantic colour, kept — muted, not removed.
+     These three were greys (#b6bcc2 / #7e848b / #565b61), which put "did not
+     stand" at 1.77:1 against its own card. It is drawn as a 2px left border on
+     the board card and as 10px uppercase text, so it failed both the 3:1
+     graphical floor and the 4.5:1 text bar: the most consequential verdict in
+     the app was the one thing you could not see.
+
+     Chroma is what distinguishes them here — the whole point of a low-chroma
+     theme is that lightness is spent on surfaces and seat ramps. Three greys
+     differ only in lightness, and grey #7e848b against grey #565b61 is a
+     difference of 1.81:1, i.e. a shade, not a signal.
+
+     So: desaturated green / amber / rose at the lightness the dark themes
+     already use, matched to Slate's treatment so the two low-chroma themes read
+     as a pair. All three clear 4.5:1 as text on this theme's own surfaces and
+     3:1 on the lightest one. Hues sit ~135° apart, and lightness runs
+     ok < warn < bad as a second channel for anyone who cannot separate the hues
+     at all. `themes.test.ts` holds all of this. */
+  --ok: #93c4a4;
+  --warn: #c9a86b;
+  --bad: #d99a94;
+  --bad-soft: #2a2124;
+  --focus: #d7d9dc;
+  --shadow-1: 0 1px 2px rgb(0 0 0 / 0.4), 0 6px 24px -8px rgb(0 0 0 / 0.5);
+  --shadow-pop: 0 12px 44px -10px rgb(0 0 0 / 0.65);
+  --glow: 0 0 0 1px rgb(255 255 255 / 0.28), 0 4px 24px -2px rgb(255 255 255 / 0.12);
+  --ambient-1: transparent;
+  --ambient-2: transparent;
+  --bar-leader-a: rgb(255 255 255 / 0.16);
+  --bar-leader-b: rgb(255 255 255 / 0.34);
+  --avatar-ink: #161718;
+  --avatar-ink-invert: #f2f3f4;
+  --chevron-svg: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%2396999e' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E");
+  /* Seat ramp: twelve greys, lightest first, spaced evenly in relative
+     luminance rather than by eye. The floor is not cosmetic — every step has
+     to clear 2.5:1 against this canvas or the darkest seat's rail border and
+     board dot simply disappear, which reads as the seat being absent.
+     The darkest steps here sit at 2.60:1. */
+  --seat-1: #f1f1f1;
+  --seat-2: #e8e8e8;
+  --seat-3: #dfdfdf;
+  --seat-4: #d6d6d6;
+  --seat-5: #cccccc;
+  --seat-6: #c1c1c1;
+  --seat-7: #b5b5b5;
+  --seat-8: #a8a8a8;
+  --seat-9: #9a9a9a;
+  --seat-10: #8a8a8a;
+  --seat-11: #777777;
+  --seat-12: #5f5f5f;
+  /* Glyph ink, per step — see the note in the Amber block. Steps 11 and 12 are
+     dark enough that light ink wins there; the rest take near-black. */
+  --seat-ink-1: #161718;
+  --seat-ink-2: #161718;
+  --seat-ink-3: #161718;
+  --seat-ink-4: #161718;
+  --seat-ink-5: #161718;
+  --seat-ink-6: #161718;
+  --seat-ink-7: #161718;
+  --seat-ink-8: #161718;
+  --seat-ink-9: #161718;
+  --seat-ink-10: #161718;
+  --seat-ink-11: #f2f3f4;
+  --seat-ink-12: #f2f3f4;
+}
+
+/*
+  Monochrome high contrast: black on white, with the three verdicts tinted.
+
+  Borderlines are pushed to the 3:1 a UI edge needs rather than the 1.3:1 the
+  sage themes sit at. The verdicts keep a muted green / amber / rose — spaced
+  widely in hue as well as lightness, after the grey versions proved unreadable
+  at 1.67:1. The ambient washes are off: at this contrast a
+  background gradient is a lie about where the content starts.
+*/
+[data-theme="mono-hc"] {
+  color-scheme: dark;
+  --canvas: #000000;
+  --surface: #0d0d0d;
+  --surface-2: #1a1a1a;
+  --surface-3: #2b2b2b;
+  --line: #6e6e6e;
+  --line-2: #9a9a9a;
+  --ink: #ffffff;
+  --ink-2: #e4e4e4;
+  --ink-3: #c4c4c4;
+  --primary: #ffffff;
+  --primary-hover: #ffffff;
+  --on-primary: #000000;
+  --primary-soft: #262626;
+  /* Semantic colour, kept — muted, not removed.
+     The same correction as Graphite, and it matters more here: this theme exists
+     to be maximally legible, and `--bad` was #4d4d4d on #000000 — 1.67:1. "Did
+     not stand" was the least visible thing on the screen, in the theme whose
+     entire claim is that nothing is.
+
+     Muted means desaturated, not dark: on pure black a muddy colour loses its
+     hue before it loses its contrast, so these keep their lightness and give
+     up only saturation. Body text stays #ffffff — this is still the
+     highest-contrast theme in the app, and nothing about reading the transcript
+     is affected. Only the three signals are tinted. */
+  --ok: #8ed0a8;
+  --warn: #d0b573;
+  --bad: #e09a9a;
+  --bad-soft: #241a1c;
+  --focus: #ffffff;
+  --shadow-1: 0 0 0 1px rgb(255 255 255 / 0.16);
+  --shadow-pop: 0 0 0 1px rgb(255 255 255 / 0.3);
+  --glow: 0 0 0 2px #ffffff;
+  --ambient-1: transparent;
+  --ambient-2: transparent;
+  --bar-leader-a: rgb(255 255 255 / 0.3);
+  --bar-leader-b: rgb(255 255 255 / 0.7);
+  --avatar-ink: #000000;
+  --avatar-ink-invert: #ffffff;
+  --chevron-svg: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23ffffff' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E");
+  /* Wider ramp than Graphite's, and stepped the same way: the extra headroom
+     against pure black is what keeps eleven seats tellable at this contrast.
+     Darkest step 2.59:1. */
+  --seat-1: #f1f1f1;
+  --seat-2: #e8e8e8;
+  --seat-3: #dfdfdf;
+  --seat-4: #d4d4d4;
+  --seat-5: #cacaca;
+  --seat-6: #bebebe;
+  --seat-7: #b2b2b2;
+  --seat-8: #a4a4a4;
+  --seat-9: #949494;
+  --seat-10: #828282;
+  --seat-11: #6d6d6d;
+  --seat-12: #505050;
+  /* Glyph ink, per step — pure black or pure white, whichever wins. Floor
+     5.17:1, the best of the three ramps. */
+  --seat-ink-1: #000000;
+  --seat-ink-2: #000000;
+  --seat-ink-3: #000000;
+  --seat-ink-4: #000000;
+  --seat-ink-5: #000000;
+  --seat-ink-6: #000000;
+  --seat-ink-7: #000000;
+  --seat-ink-8: #000000;
+  --seat-ink-9: #000000;
+  --seat-ink-10: #000000;
+  --seat-ink-11: #ffffff;
+  --seat-ink-12: #ffffff;
 }
 
 @theme inline {
@@ -101,11 +575,22 @@
     -webkit-font-smoothing: antialiased;
     overflow: hidden;
   }
-  [data-theme="dark"] body {
+  /*
+    Ambient wash, per theme. This was gated on the old two-value dark selector,
+    which meant every theme added after it silently lost the wash; now the two
+    stops are tokens and a theme that wants none just says `transparent`.
+  */
+  /*
+    Ambient wash, per theme. Deliberately *not* `background-attachment: fixed`:
+    fixed attachment makes the gradient a repaint-everything region, which costs
+    a full-viewport raster on any scroll of an inner scroller — the transcript
+    scrolls constantly. The body itself does not scroll (see `overflow: hidden`
+    above), so the wash is painted once and stays put anyway.
+  */
+  body {
     background-image:
-      radial-gradient(1200px 500px at 70% -10%, rgb(168 199 250 / 0.055), transparent 60%),
-      radial-gradient(900px 480px at 10% 110%, rgb(129 201 149 / 0.04), transparent 60%);
-    background-attachment: fixed;
+      radial-gradient(1200px 500px at 70% -10%, var(--ambient-1), transparent 60%),
+      radial-gradient(900px 480px at 10% 110%, var(--ambient-2), transparent 60%);
   }
   ::-webkit-scrollbar {
     width: 10px;
@@ -220,10 +705,12 @@
     @apply text-[11px] font-semibold tracking-[0.12em] text-ink-3 uppercase;
   }
 
-  /* Seat avatar: a small colored disc with the seat's initial. */
+  /* Seat avatar: a disc in the seat's colour with its glyph on it. The ink is a
+     token because the seat colours span the tonal range in every theme and a
+     fixed dark ink here fought the inline value it was always overridden by. */
   .avatar {
     @apply flex size-6 shrink-0 items-center justify-center rounded-full text-[11px] font-bold;
-    color: #0b0e13;
+    color: var(--avatar-ink);
   }
 
   /* Status pills for speaking / next / skipped / live.
@@ -242,7 +729,13 @@
     @apply flex h-1.5 w-full gap-px overflow-hidden rounded-full bg-surface-3;
   }
   .spread > i {
-    @apply block h-full min-w-1 rounded-full transition-all duration-500;
+    /* `transition-[width]` rather than `transition-all`.
+       `all` includes `width`, which is a layout property: animating it re-runs
+       layout for every point's strip and every poll bar on every ballot, and a
+       poll with a few options meant that 60 times a second. Naming the property
+       keeps the same 500ms ease with no per-frame layout. `min-w-1` is kept so a
+       zero-width slice is still a hairline rather than nothing. */
+    @apply block h-full min-w-1 rounded-full transition-[width] duration-500;
   }
 
   /* Poll option bars. */
@@ -250,16 +743,17 @@
     @apply relative h-6 overflow-hidden rounded-lg bg-surface-3;
   }
   .bar > i {
-    @apply absolute inset-y-0 left-0 rounded-lg transition-all duration-500;
+    @apply absolute inset-y-0 left-0 rounded-lg transition-[width] duration-500;
     background: linear-gradient(90deg, var(--primary-soft), var(--primary-soft));
     border: 1px solid var(--line-2);
   }
+  /* Both stops are tokens: the two stops were a hardcoded blue that ignored
+     --primary entirely, and a dark-only override, so the sage themes showed a
+     blue leader bar and every new theme would have inherited whichever it
+     matched. */
   .bar.leader > i {
-    background: linear-gradient(90deg, rgb(26 115 232 / 0.25), rgb(26 115 232 / 0.45));
+    background: linear-gradient(90deg, var(--bar-leader-a), var(--bar-leader-b));
     border-color: var(--primary);
-  }
-  [data-theme="dark"] .bar.leader > i {
-    background: linear-gradient(90deg, rgb(168 199 250 / 0.18), rgb(168 199 250 / 0.38));
   }
 
   /* Transcript action rows: tool tag + prose. */
@@ -553,11 +1047,15 @@
 
 @layer components {
   /* Native controls are what make a dark UI look unfinished. Dress them. */
+  /* An SVG data URL cannot read a custom property for its stroke, so the chevron
+     is themed by handing each theme the whole image via --chevron-svg rather
+     than by trying to tint it here. A fixed grey stroke vanished against the
+     monochrome themes, which is what this fixes. */
   select.field {
     appearance: none;
     padding-right: 28px;
     cursor: pointer;
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%239aa0a6' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E");
+    background-image: var(--chevron-svg);
     background-repeat: no-repeat;
     background-position: right 10px center;
   }
@@ -624,5 +1122,113 @@
   input[type="number"]::-webkit-inner-spin-button {
     -webkit-appearance: none;
     margin: 0;
+  }
+
+  /*
+    Mobile and PWA: one hand, one thumb, a notch, and a keyboard that eats
+    half the screen. Desktop rules above stay untouched; everything here is
+    additive and scoped to viewports or coarse pointers.
+  */
+
+  /* Dynamic viewport: on phones 100vh includes the area behind the browser
+     chrome, so the composer sat underneath it. dvh tracks what is visible. */
+  html,
+  body,
+  #root {
+    height: 100dvh;
+  }
+  /* Board tables gain a delegate column per seat, so a wide council overflows
+     a phone. The transcript already scrolls vertically; tables scroll
+     sideways inside their card instead of pushing the whole page wide. */
+  .md {
+    overflow-x: auto;
+  }
+  .md table {
+    max-width: 100%;
+  }
+
+  /* Phones get one column and the transcript keeps it: side panels become
+     capped sheets rather than full-height columns that leave nothing to
+     read. 720px sits below the 880px stack point so tablets are unaffected. */
+  @media (max-width: 720px) {
+    .chamber > .chamber-left,
+    .chamber > .chamber-right {
+      max-height: 32dvh;
+    }
+    /* Panel toggles and icon buttons are 32px on desktop; a thumb needs 44.
+       Text buttons keep their size — only the hit area grows. */
+    .btn {
+      min-height: 44px;
+    }
+    /* Below 16px iOS zooms the whole page on focus and never zooms back.
+       Desktop keeps its denser type; phones get readable, stable fields. */
+    .field,
+    input.field,
+    textarea.field,
+    select.field {
+      font-size: max(16px, 1rem);
+    }
+  }
+
+  /* Coarse pointers get roomier controls wherever they appear, not just on
+     small screens — a large tablet in landscape is still a thumb device. */
+  @media (pointer: coarse) {
+    input[type="checkbox"].size-3\.5 {
+      width: 1.25rem;
+      height: 1.25rem;
+    }
+    input[type="range"]::-webkit-slider-thumb {
+      width: 22px;
+      height: 22px;
+    }
+    input[type="range"]::-moz-range-thumb {
+      width: 19px;
+      height: 19px;
+    }
+  }
+}
+
+/* The notch and the home bar are outside the layout viewport, but content flush
+   against the edges still slides under them. Pad the chrome, not the reading
+   surface: header, composer and sheet edges. Unsupported engines drop the env()
+   declarations and keep the base padding.
+
+   In `@layer utilities`, deliberately. Tailwind declares
+   `@layer theme, base, components, utilities;`, and every element using these
+   also carries a padding utility — `safe-x px-4`, `safe-bottom px-4 py-3`. In the
+   components layer those utilities win on layer order at equal specificity, so all
+   three rules were inert: in landscape on a notched phone the header's buttons sat
+   under the notch, and on a home-indicator phone the composer's Send button sat
+   under the indicator, reachable only by stretching past it. */
+@layer utilities {
+  .safe-top {
+    padding-top: max(0.5rem, env(safe-area-inset-top));
+  }
+  .safe-bottom {
+    padding-bottom: max(0.75rem, env(safe-area-inset-bottom));
+  }
+  .safe-x {
+    padding-left: max(1rem, env(safe-area-inset-left));
+    padding-right: max(1rem, env(safe-area-inset-right));
+  }
+
+  /* Reduced motion, for the Tailwind animation utilities.
+     The `prefers-reduced-motion` block in `@layer components` cannot cover these:
+     `.animate-pulse` and friends *are* Tailwind utilities, declared in the
+     `utilities` layer, which is later in the order at equal specificity — so a
+     rule in `components` loses to the very animation it is cancelling. A
+     reduced-motion reader was still given a pulsing caret for the length of
+     every speech and three bouncing dots while waiting on a model, which is
+     precisely the flicker the preference asks to stop.
+
+     Neutral, not removed: both still say "this is happening" without moving.
+     Same layer-or-later reasoning as the safe-area rules above. */
+  @media (prefers-reduced-motion: reduce) {
+    .animate-pulse,
+    .animate-bounce,
+    .animate-spin,
+    .animate-ping {
+      animation: none;
+    }
   }
 }

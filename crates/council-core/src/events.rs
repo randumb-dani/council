@@ -5,7 +5,7 @@ use crate::types::{
     CarriedPoint, DebateVerdict, Point, Poll, SeatRole, Speech, StalemateReading, StalemateReview,
     Tally, Verdict,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
@@ -35,6 +35,27 @@ pub enum EngineEvent {
         color: String,
         model: String,
         round: u32,
+    },
+    /// The floor belongs to the operator: this seat is taken by a human, so
+    /// instead of a model reply the turn waits for a submit. `brief` is the
+    /// same board-plus-floor text a model would be shown, which is what keeps
+    /// the human honest — they argue from the record, not from memory.
+    YourTurn {
+        turn: u64,
+        delegate: String,
+        label: String,
+        round: u32,
+        brief: String,
+    },
+    /// A ballot the operator must answer for their seat: a poll, a deadlock
+    /// review, an adjournment confirmation, or an extension ballot. `options`
+    /// are the legal answers; anything else is refused at submit time.
+    BallotAsked {
+        delegate: String,
+        kind: BallotKind,
+        question: String,
+        options: Vec<String>,
+        point_id: Option<u32>,
     },
     /// A request is in flight and no tokens have arrived yet, or tokens are
     /// arriving slowly. The UI uses this to show that a slow model is still
@@ -224,6 +245,35 @@ pub enum NoticeTone {
     Error,
 }
 
+/// Which ballot is waiting on the operator. Serialized so the UI can route
+/// each kind to its own prompt without string-matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BallotKind {
+    Poll,
+    Review,
+    Adjourn,
+    Extension,
+}
+
+impl BallotKind {
+    /// In words, for the refusals that name the mismatch.
+    pub fn as_words(self) -> &'static str {
+        match self {
+            Self::Poll => "poll",
+            Self::Review => "deadlock review",
+            Self::Adjourn => "adjournment",
+            Self::Extension => "extension",
+        }
+    }
+
+    /// Every kind here is a question the council asks a seat, so all of them
+    /// can be put to the operator.
+    pub fn can_ask(self) -> bool {
+        true
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DelegateBrief {
@@ -233,6 +283,10 @@ pub struct DelegateBrief {
     pub color: String,
     pub endpoint: String,
     pub role: SeatRole,
+    /// Taken by the operator. The rail marks the seat, and a reload still knows
+    /// it does not belong to a model.
+    #[serde(default)]
+    pub human: bool,
 }
 
 /// A point flattened for the transcript, so the UI need not walk the board.

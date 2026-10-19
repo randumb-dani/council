@@ -200,12 +200,22 @@ impl WebBackend for HttpWeb {
                     .map_err(|e| WebError::Fetch(format!("{url}: {e}")))?;
                 if buf.len() + chunk.len() > MAX_BYTES {
                     buf.extend_from_slice(&chunk[..MAX_BYTES.saturating_sub(buf.len())]);
+                    // The cap can land inside a multi-byte character, and the decode
+                    // below then failed on the *whole* page — turning a readable but
+                    // over-long article into "returned text that is not utf-8" and the
+                    // seat getting nothing. Cut on a character boundary instead, which
+                    // is what the cap was for: read it, and stop.
+                    while std::str::from_utf8(&buf).is_err() && buf.last().is_some_and(|b| b & 0xC0 == 0x80) {
+                        buf.pop();
+                    }
                     break;
                 }
                 buf.extend_from_slice(&chunk);
             }
-            String::from_utf8(buf)
-                .map_err(|_| WebError::Fetch(format!("{url} returned text that is not utf-8")))
+            // Lossy, not strict: a genuinely non-UTF-8 page degrades to replacement
+    // characters the model can still read, which is better than refusing the page
+    // outright over one bad byte.
+    Ok(String::from_utf8_lossy(&buf).into_owned())
         }
     }
 }
@@ -480,6 +490,23 @@ async fn one_search(
     }
 }
 
+/// Keep the first `max_chars` chars of an extract, reporting whether anything
+/// was cut.
+///
+/// Byte-length pre-check first (at most `max_chars` bytes means at most that
+/// many chars), then one partial scan for the cut — not a full count plus a
+/// take. The cut comes from `char_indices`, so multibyte text is never split;
+/// `None` means it fit despite the byte length.
+fn take_chars(text: &str, max_chars: usize) -> (String, bool) {
+    if text.len() <= max_chars {
+        return (text.to_string(), false);
+    }
+    match text.char_indices().nth(max_chars).map(|(i, _)| i) {
+        Some(at) => (text[..at].to_string(), true),
+        None => (text.to_string(), false),
+    }
+}
+
 /// Read a page, trying the requested source and falling back to the other one
 /// when the title is not where it was looked for.
 ///
@@ -517,8 +544,7 @@ pub async fn fetch(
         match backend.get(&url).await {
             Ok(body) => match parse_extract(&body) {
                 Some(ex) => {
-                    let truncated = ex.text.chars().count() > max_chars;
-                    let text: String = ex.text.chars().take(max_chars).collect();
+                    let (text, truncated) = take_chars(&ex.text, max_chars);
                     let text = if truncated {
                         format!(
                             "{text}\n\n[cut at {max_chars} characters — fetch the page again with a \
@@ -562,11 +588,14 @@ fn split_url(raw: &str) -> (Option<String>, String) {
     };
     let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
     let path = rest.split_once('/').map(|(_, p)| p).unwrap_or("");
-    let last = path
-        .split(['/', '#', '?'])
-        .filter(|s| !s.is_empty())
-        .next_back()
-        .unwrap_or("");
+    // Fragment and query off *first*, then take the last path segment. Splitting all
+    // three at once and taking the last piece made the fragment the title:
+    // `.../wiki/Tautology_(logic)#Etymology` became "Etymology", and
+    // `.../w/index.php?title=Tautology_(logic)` became "title=Tautology_(logic)" —
+    // so the tool reported "no article called Etymology" and threw away a title it
+    // had been handed. Section links are exactly what a model pastes.
+    let path = path.split(['#', '?']).next().unwrap_or("");
+    let last = path.split('/').filter(|s| !s.is_empty()).next_back().unwrap_or("");
     if last.is_empty() {
         return (Some(host.to_string()), String::new());
     }
@@ -717,6 +746,24 @@ mod tests {
         assert_eq!(Source::parse("WIKI"), Source::Wikipedia);
         assert_eq!(Source::parse("dictionary"), Source::Wiktionary);
         assert_eq!(Source::parse("whatever"), Source::Auto);
+    }
+
+    /// `take_chars` on multibyte input: same head as `chars().take(n)`, and
+    /// no split characters — including input that fits by chars but not bytes.
+    #[test]
+    fn take_chars_never_splits_multibyte_input() {
+        let s = format!("{}{}", "🎉".repeat(50), "x".repeat(900));
+        let old_truncated = s.chars().count() > 800;
+        let old_head: String = s.chars().take(800).collect();
+        let (got, truncated) = take_chars(&s, 800);
+        assert_eq!(truncated, old_truncated);
+        assert_eq!(got, old_head);
+        assert_eq!(got.as_bytes(), old_head.as_bytes(), "byte output must match");
+        assert!(!got.contains('�'), "a char was split: {got:?}");
+        // Fits by chars (3) but not by bytes (12): untouched, uncut.
+        let emoji = "🎉".repeat(3);
+        assert_eq!(take_chars(&emoji, 3), (emoji.clone(), false));
+        assert_eq!(take_chars("abc", 10), ("abc".to_string(), false));
     }
 }
 

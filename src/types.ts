@@ -140,9 +140,59 @@ export interface DebateVerdict {
   conclusion: Conclusion | null;
 }
 
+export type Provider =
+  | "openaiCompatible"
+  | "gemini"
+  | "deepseek"
+  | "openrouter"
+  | "anthropic";
+
+/**
+ * The documented base URL for each provider.
+ *
+ * A default, not an override: picking a provider fills these in and every field
+ * stays editable, because running your own proxy in front of any of them is a
+ * normal thing to do.
+ */
+export const PROVIDER_BASE_URL: Record<Provider, string> = {
+  openaiCompatible: "http://127.0.0.1:8888",
+  gemini: "https://generativelanguage.googleapis.com/v1beta/openai",
+  deepseek: "https://api.deepseek.com",
+  openrouter: "https://openrouter.ai/api/v1",
+  anthropic: "https://api.anthropic.com",
+};
+
+export const PROVIDER_LABEL: Record<Provider, string> = {
+  openaiCompatible: "OpenAI-compatible",
+  gemini: "Google Gemini",
+  deepseek: "DeepSeek",
+  openrouter: "OpenRouter",
+  anthropic: "Anthropic Claude",
+};
+
+/**
+ * How much thinking a model does before answering, per provider.
+ *
+ * Gemini names its levels differently from everything else and will reject an
+ * OpenAI-shaped `reasoning_effort` rather than ignore it, so the values offered
+ * are the provider's own.
+ */
+export const PROVIDER_EFFORTS: Record<Provider, readonly string[]> = {
+  openaiCompatible: ["low", "medium", "high", "xhigh"],
+  gemini: ["minimal", "low", "medium", "high"],
+  deepseek: ["low", "medium", "high", "max"],
+  openrouter: ["low", "medium", "high"],
+  // Anthropic's future `output_config.effort` vocabulary. Controls are disabled
+  // for now because thinking modes differ by model generation; these names only
+  // document where a later mapping should start.
+  anthropic: ["low", "medium", "high", "max"],
+};
+
 export interface EndpointConfig {
   id: string;
   name: string;
+  /** Which API this server speaks. Sets defaults; every field stays editable. */
+  provider: Provider;
   baseUrl: string;
   apiKey: string | null;
   headers: Record<string, string>;
@@ -171,11 +221,19 @@ export interface DelegateConfig {
   model: string;
   endpointId: string;
   color: string;
-  /** The seat's fixed role. The four convening essentials sit exactly once each; the Rationale at most once. */
+  /** The seat's fixed role — the four convening essentials sit exactly once each; the Rationale at most once. */
   seatRole: SeatRole;
   role: string | null;
   persona: string | null;
   temperature: number | null;
+  /**
+   * Taken by the operator rather than a model.
+   *
+   * The engine waits for this seat's turn instead of calling an endpoint, so
+   * `model` and `endpointId` are not required — only on arguing seats. Judging
+   * and summarizing stay with the models and are refused if marked here.
+   */
+  human?: boolean;
 }
 
 /**
@@ -191,6 +249,45 @@ export type ReasoningWire = "serverDefault" | "flat" | "chatTemplate";
 
 export type SeatRole = "proponent" | "opponent" | "judge" | "rationale" | "summarizer" | "custom";
 
+/** Every seat role, for validating values read back out of storage. */
+export const SEAT_ROLES: readonly SeatRole[] = [
+  "proponent",
+  "opponent",
+  "judge",
+  "rationale",
+  "summarizer",
+  "custom",
+];
+
+/** The debating roles — the ones a person may take. See `canBeTakenByOperator`. */
+const TAKEABLE_ROLES: readonly SeatRole[] = ["proponent", "opponent", "rationale", "custom"];
+
+/** Which ballot is waiting on the operator. Matches the engine's enum. */
+export type BallotKind = "poll" | "review" | "adjourn" | "extension";
+
+/** One tool call as the action picker produces it: the same shape the engine
+ *  validates for a model, so there is one dialect rather than two. */
+export interface HumanActionCall {
+  id: string;
+  name: string;
+  arguments: Record<string, unknown>;
+}
+
+/** What a taken turn submits. */
+export interface HumanTurnSubmit {
+  text: string;
+  thinking: string;
+  calls: HumanActionCall[];
+}
+
+/** What a taken ballot submits — one variant per ballot kind, so a client
+ *  cannot answer a poll with a deadlock reading. */
+export type HumanBallotSubmit =
+  | { kind: "poll"; choice: string; reason: string | null; confidence: number | null }
+  | { kind: "review"; reading: string; reason: string | null; vote: Verdict | null }
+  | { kind: "adjourn"; confirm: boolean; reason: string | null }
+  | { kind: "extension"; grant: boolean; reason: string | null };
+
 export const ROLE_LABEL: Record<SeatRole, string> = {
   proponent: "Proponent",
   opponent: "Opponent",
@@ -199,6 +296,36 @@ export const ROLE_LABEL: Record<SeatRole, string> = {
   summarizer: "Summarizer",
   custom: "Custom",
 };
+
+/**
+ * What each role is for, as one plain sentence.
+ *
+ * The rail's role pill showed this for only two of the five roles, so most of
+ * them explained themselves nowhere. Every role now has one, including the
+ * custom case, which is the only way a user learns what filling that row does.
+ */
+export const ROLE_HINT: Record<SeatRole, string> = {
+  proponent: "Argues for the motion. It raises the points it wants to win.",
+  opponent: "Argues against the motion, and is expected to steelman it first — that is, to state the other side as well as its own side could.",
+  judge: "Votes on each point once the argument is over. It does not argue itself.",
+  rationale: "Looks for weaknesses in the reasoning — contradictions, claims nothing supports, conclusions that do not follow.",
+  summarizer: "Keeps track of what has happened and writes the answer at the end. It never argues a side.",
+  custom: "An extra delegate you added. It argues the motion alongside the others.",
+};
+
+/**
+ * Which roles the operator may argue themselves.
+ *
+ * The debating roles only, and the same rule the engine enforces: an Arbiter
+ * ruling on an argument they took part in is not adjudication, and a
+ * Summarizer writing the result they argued for is not a record.
+ */
+export function canBeTakenByOperator(role: unknown): boolean {
+  return (
+    typeof role === "string" &&
+    (TAKEABLE_ROLES as readonly string[]).includes(role)
+  );
+}
 
 export type DecisionProvider = "seat" | "jev";
 
@@ -213,6 +340,13 @@ export interface DecisionConfig {
 export interface DebateConfig {
   motion: string;
   extraInstructions: string | null;
+  /** The record of an unfinished debate being resumed, carried in the prompt.
+   *
+   * Its own field rather than folded into `extraInstructions`: that field is the
+   * operator's standing instructions, they are saved, and a resume was overwriting
+   * them with up to 6000 characters of transcript — permanently, so the *next*
+   * unrelated debate was still being handed a dead debate's argument. */
+  resumeRecord?: string | null;
   endpoints: EndpointConfig[];
   delegates: DelegateConfig[];
   maxRounds: number;
@@ -269,6 +403,8 @@ export interface DelegateBrief {
    * meanings, one name; anything reading `state.delegates` wants this one.
    */
   role: SeatRole;
+  /** Taken by the operator rather than a model. */
+  human?: boolean;
 }
 
 export type EngineEvent =
@@ -291,6 +427,26 @@ export type EngineEvent =
       color: string;
       model: string;
       round: number;
+    }
+  /** The floor belongs to the operator: this seat is taken, so the turn waits
+   *  for a submit. `brief` is the same board-plus-floor text a model would be
+   *  shown, which is what keeps a human arguing from the record. */
+  | {
+      type: "yourTurn";
+      turn: number;
+      delegate: string;
+      label: string;
+      round: number;
+      brief: string;
+    }
+  /** A ballot the operator must answer for their seat. */
+  | {
+      type: "ballotAsked";
+      delegate: string;
+      kind: BallotKind;
+      question: string;
+      options: string[];
+      pointId: number | null;
     }
   | {
       /** What the engine is doing right now, in words meant for the operator. */
@@ -379,8 +535,18 @@ export type EngineEvent =
  * datalist that knows what this model actually accepts, and the operator needs
  * to know that guessing is not free.
  */
+/**
+ * How much a model thinks before answering, as one number.
+ *
+ * Server-specific, and a wrong value is usually rejected rather than ignored,
+ * so this needs to name the servers a user is most likely to be pointing at.
+ * The per-server quirks (Qwen's xhigh returning empty on llama.cpp,
+ * llama-server lacking the field entirely) live in the README, not in a
+ * tooltip nobody can read — a native `title` cannot render a newline, so the
+ * old three-paragraph string arrived as one run-on line.
+ */
 export const REASONING_EFFORT_HINT =
-  "Qwen3.5/3.6/3.8: low, medium, xhigh · OpenAI: low, medium, high · DeepSeek adds max";
+  "Higher lets a model think longer before answering. What each provider accepts is listed as you type.";
 
 export const VERDICT_GLYPH: Record<Verdict, string> = {
   win: "▲",
@@ -388,10 +554,30 @@ export const VERDICT_GLYPH: Record<Verdict, string> = {
   stalemate: "◆",
 };
 
+/**
+ * The same three outcomes as words, for screen readers and tooltips.
+ *
+ * The glyphs alone are not self-describing — a tooltip reading `win` or
+ * `lose` was leaking the engine's enum, and `▲`/`▼`/`◆` mean nothing to a
+ * screen reader. Every place that explains a rating uses this.
+ */
+export const VERDICT_LABEL: Record<Verdict, string> = {
+  win: "supports",
+  lose: "opposes",
+  stalemate: "neither",
+};
+
+/**
+ * Why a tie could not be settled by the delegates.
+ *
+ * "Decidable" is a neologism most readers will not have met, and "too dense
+ * for this council" blamed the delegates for the point being hard. Each says
+ * what happened instead.
+ */
 export const READING_LABEL: Record<StalemateReading, string> = {
-  unsolvable: "unsolvable",
-  too_dense: "too dense for this council",
-  decidable: "decidable",
+  unsolvable: "no clear answer",
+  too_dense: "too tangled to decide",
+  decidable: "could be decided",
 };
 
 export const STATUS_LABEL: Record<PointStatus, string> = {

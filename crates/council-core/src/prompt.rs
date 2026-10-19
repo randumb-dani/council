@@ -178,6 +178,20 @@ pub fn system_prompt(
     if let Some(extra) = cfg.extra_instructions.as_deref().filter(|e| !e.trim().is_empty()) {
         s.push_str(&format!("\nSTANDING INSTRUCTIONS: {extra}\n"));
     }
+    if let Some(record) = cfg.resume_record.as_deref().filter(|r| !r.trim().is_empty()) {
+        // A resumed debate. The board starts empty, and saying so is the point: a
+        // delegate handed a transcript will otherwise assume the points in it are
+        // live and re-raise them.
+        s.push_str(
+            "\nYOU ARE RESUMING A DEBATE THAT DID NOT FINISH. The record below is what\
+             \nwas said before it was cut off. The board you can see is EMPTY — nothing\
+             \nin that record is a point on it, so treat every argument in it as\
+             \ncontext to build on or correct, and raise your own points as usual.\n\
+             RECORD SO FAR:\n",
+        );
+        s.push_str(record);
+        s.push('\n');
+    }
     s.push_str(&format!(
         "\n\nThis council is set for {} rounds, though an extension can add more.\n\n",
         cfg.max_rounds.max(1)
@@ -207,6 +221,10 @@ pub fn system_prompt(
 /// Those begin with the board and carry the floor. The board is regenerated from
 /// scratch every turn and the newest one supersedes every older one, so this is
 /// how the engine recognises the copies it is allowed to throw away.
+///
+/// `starts_with`, not `contains`, and the difference is load-bearing: the
+/// opening message is also a user message, and a looser match would let a brief
+/// matcher recognise it and prune the motion away along with the briefs.
 pub fn is_turn_brief(m: &crate::client::ChatMessage) -> bool {
     m.role == "user" && m.content.starts_with("THE BOARD")
 }
@@ -265,11 +283,17 @@ fn status_label(s: PointStatus) -> &'static str {
 
 fn clip(s: &str, n: usize) -> String {
     let s = s.trim();
-    if s.chars().count() <= n {
-        s.to_string()
-    } else {
-        let head: String = s.chars().take(n).collect();
-        format!("{head}…")
+    if s.len() <= n {
+        // At most `n` bytes, so at most `n` chars: already fits.
+        return s.to_string();
+    }
+    // `nth(n)` is where char number `n` (0-indexed) starts, so `s[..at]` is
+    // the first `n` chars — byte-identical to `chars().take(n).collect()` —
+    // found in a single partial scan instead of a count plus a take. `None`
+    // means multibyte input with at most `n` chars despite the byte length.
+    match s.char_indices().nth(n).map(|(i, _)| i) {
+        Some(at) => format!("{}…", &s[..at]),
+        None => s.to_string(),
     }
 }
 
@@ -951,5 +975,28 @@ mod tests {
                 "the primer promises {promise:?} and the engine has to do it"
             );
         }
+    }
+
+    /// `clip` on multibyte input: same head as `chars().take(n)`, and no
+    /// split characters — including input that fits by chars but not bytes.
+    #[test]
+    fn clip_never_splits_multibyte_input() {
+        let s = format!("  {}{}  ", "漢".repeat(100), "x".repeat(700));
+        let t = s.trim();
+        let old = if t.chars().count() <= 600 {
+            t.to_string()
+        } else {
+            format!("{}…", t.chars().take(600).collect::<String>())
+        };
+        let got = clip(&s, 600);
+        assert_eq!(got, old);
+        assert_eq!(got.as_bytes(), old.as_bytes(), "byte output must match");
+        assert!(!got.contains('�'), "a char was split: {got:?}");
+        // Trims, like before: surrounding whitespace never reaches the output.
+        assert!(!got.starts_with(' ') && !got.ends_with(' '));
+        // Fits by chars (4) but not by bytes (16): untouched but trimmed.
+        let emoji = "  🎉🎉🎉🎉  ";
+        assert_eq!(clip(emoji, 4), "🎉🎉🎉🎉");
+        assert_eq!(clip("abc", 10), "abc");
     }
 }

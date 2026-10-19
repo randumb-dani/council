@@ -47,9 +47,6 @@ src-tauri/gen
 
 # Stale pre-rewrite duplicates of src/ (older App.tsx / CouncilRail.tsx).
 # Safe to delete — git has never tracked them.
-dillmmonouser/
-
-# Misc
 coverage
 *.tsbuildinfo
 .vite

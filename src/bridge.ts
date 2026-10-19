@@ -1,15 +1,28 @@
 // Talking to Rust.
 //
-// Everything here degrades gracefully: opened in a plain browser (`npm run
-// dev`) rather than inside Tauri, the app runs against a scripted stand-in so
-// the interface can be worked on without an endpoint to hand.
+// Everything here degrades gracefully, in two stages. Inside Tauri the engine
+// is a command away. In a plain browser served by `council-serve`, the same
+// engine answers over same-origin REST/SSE (`serverBridge`). Anywhere else
+// (`npm run dev` against Vite directly) the app runs against a scripted
+// stand-in so the interface can be worked on without an endpoint to hand.
 
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { useEffect, useState } from "react";
+// No static `@tauri-apps/api` import: the bundler cannot drop it, so every web
+// visitor would download it while only the desktop app ever calls it. These
+// dynamic imports become on-demand chunks that plain browsers never fetch —
+// the module registry caches them, so repeated calls cost a promise tick.
+async function invokeTauri<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  const api = await import("@tauri-apps/api/core");
+  return api.invoke<T>(cmd, args);
+}
+import * as server from "./serverBridge";
 import type {
+  BallotKind,
   DebateConfig,
   EndpointConfig,
   EngineEvent,
+  HumanBallotSubmit,
+  HumanTurnSubmit,
   Point,
   PointStatus,
   Poll,
@@ -23,56 +36,159 @@ export const EVENT_CHANNEL = "council://event";
 export const inTauri = (): boolean =>
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
+/** Cached same-origin server probe; re-exported so panels can adapt. */
+export const isServed = server.isServed;
+export const detectServed = server.detectServed;
+
+/** True once the local server has answered. Drives the served/preview UI. */
+export function useServedMode(): boolean {
+  const [served, setServed] = useState(server.isServed());
+  useEffect(() => {
+    let live = true;
+    server.detectServed().then((v) => {
+      if (live) setServed(v);
+    });
+    return () => {
+      live = false;
+    };
+  }, []);
+  return served;
+}
+
+/** In a browser: the local server when it answers, the mock otherwise. */
+async function servedOrMock<T>(op: () => Promise<T>, fallback: () => T | Promise<T>): Promise<T> {
+  if (inTauri()) throw new Error("unreachable: Tauri path handles this above");
+  if (await server.detectServed()) return op();
+  return fallback();
+}
+
 export async function startDebate(config: DebateConfig): Promise<void> {
-  if (!inTauri()) return mock.start(config);
-  await invoke("start_debate", { config });
+  if (inTauri()) {
+    await invokeTauri("start_debate", { config });
+    return;
+  }
+  return servedOrMock(() => server.start(config), () => mock.start(config));
 }
 
 export async function stopDebate(): Promise<void> {
-  if (!inTauri()) return mock.stop();
-  await invoke("stop_debate");
+  if (inTauri()) {
+    await invokeTauri("stop_debate");
+    return;
+  }
+  return servedOrMock(() => server.stop(), () => mock.stop());
 }
 
 export async function skipTurn(): Promise<boolean> {
-  if (!inTauri()) return false;
-  return invoke<boolean>("skip_turn");
+  if (inTauri()) return invokeTauri<boolean>("skip_turn");
+  return servedOrMock(() => server.skip(), () => false);
 }
 
-export async function injectNote(text: string): Promise<void> {
-  if (!inTauri()) return;
-  await invoke("inject_note", { text });
+/**
+ * Inject a note, reporting whether it landed.
+ *
+ * In the browser preview (`vite dev` with no server) the mock returns `true`:
+ * there is no room to reach, but the operator is authoring a debate they will
+ * later run, and a "nothing was delivered" error over a preset scenario would be
+ * a false alarm. See `server.injectNote` for why this is a boolean at all.
+ */
+export async function injectNote(text: string): Promise<boolean> {
+  if (inTauri()) {
+    await invokeTauri("inject_note", { text });
+    return true;
+  }
+  return servedOrMock(() => server.injectNote(text), () => true);
 }
 
 export async function resolveExtension(approved: boolean, rounds: number): Promise<string> {
-  if (!inTauri()) return "preview only — no proposal is waiting";
-  return invoke<string>("resolve_extension", { approved, rounds });
+  if (inTauri()) return invokeTauri<string>("resolve_extension", { approved, rounds });
+  return servedOrMock(
+    () => server.resolveExtension(approved, rounds),
+    () => "preview only — no proposal is waiting",
+  );
 }
 
 export interface DebateSnapshot {
   motion: string;
   round: number;
   maxRounds?: number;
-  delegates?: { id: string; label: string; model: string; color: string; endpoint: string; role: string }[];
+  delegates?: {
+    id: string;
+    label: string;
+    model: string;
+    color: string;
+    endpoint: string;
+    role: string;
+    /** Taken by the operator, so the UI marks the seat and a remount knows. */
+    human?: boolean;
+  }[];
   tallies?: Record<number, Tally>;
   points: Point[];
   polls: Poll[];
   speeches: Speech[];
   finished: boolean;
+  /** What the operator is being asked, when this debate is parked on them. */
+  pending?:
+    | { kind: "turn"; delegate: string; turn: number; round: number }
+    | {
+        kind: "ballot";
+        delegate: string;
+        ballot: BallotKind;
+        question: string;
+        options: string[];
+        pointId: number | null;
+      };
 }
 
 export async function debateState(): Promise<DebateSnapshot | null> {
-  if (!inTauri()) return null;
-  return invoke<DebateSnapshot>("debate_state");
+  if (inTauri()) return invokeTauri<DebateSnapshot>("debate_state");
+  // The snapshot shape is identical; only the transport differs.
+  return servedOrMock(
+    () => server.debateState() as Promise<DebateSnapshot | null>,
+    () => null,
+  );
 }
 
 export async function listModels(endpoint: EndpointConfig): Promise<string[]> {
-  if (!inTauri()) return [];
-  return invoke<string[]>("list_models", { endpoint });
+  if (inTauri()) return invokeTauri<string[]>("list_models", { endpoint });
+  return servedOrMock(() => server.listModels(endpoint), () => []);
+}
+
+/**
+ * Answer a taken seat's turn.
+ *
+ * Only reachable when the debate is actually parked on the operator, which is
+ * the case the scripted preview cannot produce — so the fallback is an honest
+ * refusal rather than a silent success.
+ */
+export async function submitTurn(turn: HumanTurnSubmit): Promise<void> {
+  if (inTauri()) {
+    await invokeTauri("submit_turn", { submit: turn });
+    return;
+  }
+  if (!(await server.detectServed())) {
+    throw new Error("no council is waiting for you in the browser preview");
+  }
+  await server.submitTurn(turn);
+}
+
+/** Answer a ballot on the operator's own seat. Same fallback reasoning. */
+export async function submitBallot(ballot: HumanBallotSubmit): Promise<void> {
+  if (inTauri()) {
+    await invokeTauri("submit_ballot", { ballot });
+    return;
+  }
+  if (!(await server.detectServed())) {
+    throw new Error("no council is waiting for you in the browser preview");
+  }
+  await server.submitBallot(ballot);
 }
 
 export async function subscribe(onEvent: (e: EngineEvent) => void): Promise<() => void> {
-  if (!inTauri()) return mock.subscribe(onEvent);
-  return listen<EngineEvent>(EVENT_CHANNEL, (event) => onEvent(event.payload));
+  if (inTauri()) {
+    const { listen } = await import("@tauri-apps/api/event");
+    return listen<EngineEvent>(EVENT_CHANNEL, (event) => onEvent(event.payload));
+  }
+  return servedOrMock(() => server.subscribe(onEvent), () => mock.subscribe(onEvent));
 }
 
 // ---------------------------------------------------------------------------
@@ -113,7 +229,7 @@ const SCRIPT: {
     call: ["make_point", { text: "Scoring alone is sufficient; nobody needs to re-read the argument." }],
   },
   {
-    text: "That one falls. Legibility is not a substitute for reading, and the claim says it is — so two seats against is not a close thing.",
+    text: "That one falls. Legibility is not a substitute for reading, and the claim says it is — so two delegates voting against is not a close thing.",
     call: ["vote", { point: 2, verdict: "lose", reason: "reading is the substance, scoring is the bookkeeping" }],
   },
   {

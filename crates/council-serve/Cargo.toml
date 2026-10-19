@@ -1,0 +1,24 @@
+[package]
+name = "council-serve"
+version = "0.1.0"
+edition = "2021"
+description = "Serve the Council chamber on this machine only: static UI plus a localhost REST/SSE API over the council-core engine."
+license = "MIT"
+
+[features]
+default = ["tls"]
+# rustls pulls in `ring`, which needs a C toolchain. council-core documents
+# the same split: everything the engine does works over plain HTTP, so TLS
+# can be switched off where no compiler is available. Without it, https model
+# endpoints fail at request time with an actionable error instead of silently.
+tls = ["council-core/tls"]
+
+[dependencies]
+council-core = { path = "../council-core", default-features = false }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[[bin]]
+name = "council-serve"
+path = "src/main.rs"

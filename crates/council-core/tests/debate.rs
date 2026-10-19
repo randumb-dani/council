@@ -3,12 +3,13 @@
 
 use async_trait::async_trait;
 use council_core::client::{ChatBackend, ChatChunk, ChatRequest, ChatResponse, LlmError};
-use council_core::engine::{Engine, EventSink};
-use council_core::events::{EngineEvent, NoticeTone};
+use council_core::engine::{Engine, EventSink, PendingPrompt};
+use council_core::events::{BallotKind, EngineEvent, NoticeTone};
 use council_core::tools::RawToolCall;
 use council_core::types::*;
 use serde_json::json;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Replies with a fixed script, in order. Each script is a list of turns for
 /// one delegate, consumed as that delegate speaks.
@@ -133,6 +134,8 @@ impl Recorder {
                 EngineEvent::DebateStarted { .. } => "started",
                 EngineEvent::RoundStarted { .. } => "round",
                 EngineEvent::TurnStarted { .. } => "turnStart",
+                EngineEvent::YourTurn { .. } => "yourTurn",
+                EngineEvent::BallotAsked { .. } => "ballotAsked",
                 EngineEvent::TurnProgress { .. } => "progress",
                 EngineEvent::TurnActivity { .. } => "activity",
                 EngineEvent::TurnSkipped { .. } => "skipped",
@@ -185,6 +188,19 @@ impl Recorder {
             .iter()
             .filter_map(|e| match e {
                 EngineEvent::Failed { message, .. } => Some(message.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every finished speech on the record, delegate by delegate.
+    fn speeches(&self) -> Vec<Speech> {
+        self.events
+            .lock()
+            .expect("events")
+            .iter()
+            .filter_map(|e| match e {
+                EngineEvent::SpeechFinished { speech, .. } => Some(speech.clone()),
                 _ => None,
             })
             .collect()
@@ -2040,6 +2056,85 @@ async fn a_turn_of_announced_intentions_is_labelled_inaction() {
 }
 
 #[tokio::test]
+async fn a_refused_tool_call_is_not_reported_as_inaction() {
+    // A delegate that reached for a tool and was refused has acted, badly. It
+    // must not be labelled as having sat silent, which is what happened: the
+    // parser-refusal path emitted its notice but wrote no line to the action
+    // log, and an empty log is exactly what the caller reads as "did nothing".
+    // So the turn showed "acting on the board", explained the refusal, and then
+    // claimed no action was taken.
+    let mut cfg = config();
+    cfg.max_rounds = 1;
+    let (rec, _) = run(
+        vec![
+            // No such tool, and arguments that cannot be parsed into an action.
+            Script::call("not_a_real_tool", json!({"nonsense": true})),
+            Script::text(""),
+            Script::text(""),
+        ],
+        cfg,
+    )
+    .await;
+    let logs: Vec<String> = rec
+        .events
+        .lock()
+        .expect("events")
+        .iter()
+        .filter_map(|e| match e {
+            EngineEvent::SpeechFinished { speech, .. } => Some(speech.actions.join("\n")),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !logs.iter().any(|l| l.contains("(no actions taken this turn)")),
+        "a refused call is not inaction, yet it was labelled as such: {logs:?}"
+    );
+    assert!(
+        logs.iter().any(|l| l.contains("(refused")),
+        "the refusal should be on the record: {logs:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_repeated_call_is_not_reported_as_inaction() {
+    // Same tool, same arguments, twice. The second is folded — a stuttering
+    // model means it once — but the delegate did act, so folding must not empty
+    // the log and get the turn labelled as inaction.
+    let mut cfg = config();
+    cfg.max_rounds = 1;
+    let (rec, _) = run(
+        vec![
+            Script::call(
+                "make_point",
+                json!({"text": "Roses outrank lilies as a gift flower"}),
+            ),
+            Script::call(
+                "make_point",
+                json!({"text": "Roses outrank lilies as a gift flower"}),
+            ),
+            Script::text(""),
+            Script::text(""),
+        ],
+        cfg,
+    )
+    .await;
+    let logs: Vec<String> = rec
+        .events
+        .lock()
+        .expect("events")
+        .iter()
+        .filter_map(|e| match e {
+            EngineEvent::SpeechFinished { speech, .. } => Some(speech.actions.join("\n")),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !logs.iter().any(|l| l.contains("(no actions taken this turn)")),
+        "a repeated call still means the delegate acted: {logs:?}"
+    );
+}
+
+#[tokio::test]
 async fn convening_without_the_essentials_is_refused() {
     // No summarizer at all: the debate must not start.
     let mut cfg = config();
@@ -2127,7 +2222,9 @@ async fn the_rationale_argues_and_votes_after_the_arbiter() {
             })
             .collect()
     };
-    assert_eq!(order, vec!["a", "b", "c", "r"], "got {order:?}");
+    // The arguing seats speak first; the summarizer then takes two
+    // non-arguing turns, the round intermission and the conclusion.
+    assert_eq!(order, vec!["a", "b", "c", "r", "s", "s"], "got {order:?}");
     // The Rationale's vote counted: a's implicit win, b win, c lose, r win.
     assert_eq!(rec.final_board(), vec![(1, "carried", 2)]);
     let belts: Vec<Vec<String>> = backend
@@ -5668,7 +5765,8 @@ async fn a_seat_is_never_sent_two_copies_of_the_board() {
                 req.messages
                     .iter()
                     .any(|m| m.role == "user" && m.content.contains("The motion is before")),
-                "{model} lost the opening message"
+                "{model} lost the opening message: {:?}",
+                req.messages.iter().map(|m| (m.role.as_str(), m.content.chars().take(40).collect::<String>())).collect::<Vec<_>>()
             );
         }
     }
@@ -6216,4 +6314,1044 @@ async fn a_claim_of_consensus_on_a_board_that_decided_nothing_is_still_refused()
         conclusion.answer.is_empty(),
         "and the answer must not stand either: {conclusion:?}"
     );
+}
+
+/// A backend that refuses a delegate's first request for exceeding its context
+/// window, the way a real provider refuses one, and accepts whatever comes next.
+///
+/// Refusing by request index rather than anything over a size threshold keeps
+/// the test independent of how long the prompts happen to be: the sizes are an
+/// implementation detail that shifts whenever the prompt is reworded, and a
+/// test asserting on a hard-coded character count would break for that reason
+/// rather than because compaction stopped working. What matters is the
+/// *relationship*: a refusal arrives, and the next request for the same
+/// delegate is smaller than it.
+///
+/// The refusal has to come late, not first. A fresh delegate holds only the
+/// system message, the opening and the current brief, and compaction
+/// deliberately trades none of those — refusing the very first request can
+/// only ever exercise the nothing-left-to-trade path, which loses the turn by
+/// design. Refusing once the delegate has argued for a few rounds gives the
+/// resend something real to shorten.
+#[derive(Default)]
+struct OverflowOnce {
+    /// Requests seen per delegate, in order:
+    /// `(total chars, chars of the delegate's own assistant replies)`.
+    seen: Mutex<std::collections::BTreeMap<String, Vec<(usize, usize)>>>,
+    /// Set to have every request refused, for the "still does not fit" case.
+    always: bool,
+    /// Refuse the k-th request per delegate (0-based), then accept again.
+    /// `None` never refuses on its own.
+    refuse_at: Option<usize>,
+}
+
+impl OverflowOnce {
+    fn sizes(&self, who: &str) -> Vec<(usize, usize)> {
+        self.seen
+            .lock()
+            .expect("seen")
+            .get(who)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+#[async_trait]
+impl ChatBackend for OverflowOnce {
+    async fn chat(
+        &self,
+        req: &ChatRequest,
+        _on_chunk: &(dyn for<'a> Fn(ChatChunk<'a>) + Send + Sync),
+    ) -> Result<ChatResponse, LlmError> {
+        let chars: usize = req
+            .messages
+            .iter()
+            .map(|m| m.content.chars().count())
+            .sum();
+        // The model is the delegate's own: one id per seat in `config()`.
+        let who = req.model.clone();
+        let mut seen = self.seen.lock().expect("seen");
+        let n = seen.entry(who).or_default().len();
+        // The second number is what compaction actually promises to shrink: the
+        // delegate's own argument. Total size is not it, because compaction trades
+        // speeches for round summaries and a summary can be longer than the speech
+        // it stands in for.
+        let own = req
+            .messages
+            .iter()
+            .filter(|m| m.role == "assistant")
+            .map(|m| m.content.chars().count())
+            .sum();
+        seen.get_mut(&req.model)
+            .expect("just inserted")
+            .push((chars, own));
+        let refuse = self.always || self.refuse_at.is_some_and(|k| n == k);
+        drop(seen);
+        if refuse {
+            return Err(LlmError::Status {
+                url: "https://example.invalid/v1/chat/completions".into(),
+                status: 400,
+                body: format!(
+                    "{{\"error\":{{\"message\":\"This model's maximum context length is \
+                     {chars} tokens. However, you requested {chars} tokens. Please reduce \
+                     the length of the messages.\",\"code\":\"context_length_exceeded\"}}}}"
+                ),
+            });
+        }
+        // The arguing seats vote on a point that never exists, so the vote is
+        // refused and the turn still counts as acted: exactly one backend call
+        // per turn, which is what makes the request counts below exact. A bare
+        // sentence would trip the inaction re-prompt and double every count.
+        // The summarizer only ever lays rounds out, so it speaks plainly.
+        if req.model == "m-s" {
+            return Ok(ChatResponse {
+                content: "The round is laid out: nothing moved, nothing is buried.".into(),
+                ..Default::default()
+            });
+        }
+        Ok(ChatResponse {
+            content: "Noted.".into(),
+            tool_calls: vec![RawToolCall {
+                id: "x".into(),
+                name: "vote".into(),
+                arguments: json!({"point": 1, "verdict": "win", "reason": "the record stands"}),
+            }],
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test]
+async fn an_over_long_prompt_is_compacted_and_resent_rather_than_lost() {
+    // The whole point: a 400 for being too long is permanent by is_transient,
+    // so the retry loop never fired and the seat used to lose its turn outright.
+    // Now the history is shortened and the turn taken again.
+    //
+    // Five rounds, refused on the fifth: by then each seat holds the system
+    // message, the opening, four briefs and four replies, so compaction has
+    // older speeches to trade away. Refusing earlier would only prove the
+    // nothing-left path, which the next test covers.
+    let mut cfg = config();
+    cfg.max_rounds = 5;
+    let backend = Arc::new(OverflowOnce {
+        refuse_at: Some(4),
+        ..Default::default()
+    });
+    let rec = Arc::new(Recorder::default());
+    let sink: Arc<dyn EventSink> = {
+        let rec = rec.clone();
+        Arc::new(move |e: EngineEvent| rec.emit(e))
+    };
+    Engine::with_backend(backend.clone(), sink).run(cfg).await;
+
+    // Every arguing seat was refused once and resent having given up some of its
+    // own earlier argument.
+    //
+    // The invariant asserted is the delegate's *own* characters, not the prompt
+    // total. Compaction trades speeches for round summaries, so total size can
+    // legitimately rise — this test used to assert "the resend is smaller" only
+    // because the old code clipped the system prompt and opening, which clawed
+    // back more bytes than the summaries cost. That clip was itself the bug: it
+    // silently deleted most of the seat's rules on the turn where it was already
+    // under pressure. What compaction promises is that the delegate stops carrying
+    // its oldest speeches, and that is what is pinned here.
+    for model in ["m-a", "m-b", "m-c"] {
+        let sizes = backend.sizes(model);
+        assert!(
+            sizes.len() >= 2,
+            "{model} was refused and never retried: {sizes:?}"
+        );
+        assert!(
+            sizes.windows(2).any(|w| w[1].1 < w[0].1),
+            "{model}: no resend gave up any of the delegate's own speeches: {sizes:?}"
+        );
+    }
+    // And it is announced rather than suffered quietly.
+    let notices: Vec<String> = rec
+        .events
+        .lock()
+        .expect("events")
+        .iter()
+        .filter_map(|e| match e {
+            EngineEvent::Notice { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        notices
+            .iter()
+            .any(|n| n.contains("context window") || n.contains("shortened")),
+        "compaction must be visible to the operator: {notices:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_prompt_that_still_does_not_fit_loses_the_turn_and_says_so() {
+    // Compaction is last-resort, not a loop. When even the shortened prompt is
+    // refused, the turn is lost — but the operator is told the context window was
+    // the reason rather than being left to infer it from a bare 400.
+    let mut cfg = config();
+    cfg.max_rounds = 1;
+    let backend = Arc::new(OverflowOnce {
+        always: true,
+        ..Default::default()
+    });
+    let rec = Arc::new(Recorder::default());
+    let sink: Arc<dyn EventSink> = {
+        let rec = rec.clone();
+        Arc::new(move |e: EngineEvent| rec.emit(e))
+    };
+    Engine::with_backend(backend.clone(), sink).run(cfg).await;
+
+    let notices: Vec<String> = rec
+        .events
+        .lock()
+        .expect("events")
+        .iter()
+        .filter_map(|e| match e {
+            EngineEvent::Notice { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        notices
+            .iter()
+            .any(|n| n.contains("context window") || n.contains("does not fit")),
+        "the operator needs to know the window was the reason: {notices:?}"
+    );
+    // It must stop rather than compact forever: exactly one retry per delegate.
+    for model in ["m-a", "m-b", "m-c"] {
+        assert!(
+            backend.sizes(model).len() <= 2,
+            "{model} was retried without end: {:?}",
+            backend.sizes(model)
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_malformed_request_is_not_compacted_away() {
+    // The false positive that matters: a 400 for a malformed request would, if
+    // misread as an over-long prompt, cost the delegate part of its own memory
+    // for nothing. RejectUsage already proves this shape for a different field.
+    let mut cfg = config();
+    cfg.max_rounds = 1;
+    let rec = Arc::new(Recorder::default());
+    let sink: Arc<dyn EventSink> = {
+        let rec = rec.clone();
+        Arc::new(move |e: EngineEvent| rec.emit(e))
+    };
+    let backend = Arc::new(RejectUsage::default());
+    Engine::with_backend(backend.clone(), sink).run(cfg).await;
+    let notices: Vec<String> = rec
+        .events
+        .lock()
+        .expect("events")
+        .iter()
+        .filter_map(|e| match e {
+            EngineEvent::Notice { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !notices.iter().any(|n| n.contains("context window")),
+        "a malformed request must not trigger compaction: {notices:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The taken seat: a delegate the operator argues, and answers ballots for.
+// ---------------------------------------------------------------------------
+
+/// A council where one arguing seat belongs to the operator.
+///
+/// Two changes only: the seat is marked `human` and its model is blanked. The
+/// essentials and the endpoint stay exactly as they were, so the debate is
+/// otherwise the same one every other test runs.
+fn human_config(seat: &str) -> DebateConfig {
+    let mut cfg = config();
+    cfg.max_rounds = 1;
+    let d = cfg
+        .delegates
+        .iter_mut()
+        .find(|d| d.id == seat)
+        .expect("that seat is in the default council");
+    d.human = true;
+    d.model = String::new();
+    d.endpoint_id = String::new();
+    cfg
+}
+
+/// Answers parked prompts as they arrive, the way the UI does.
+///
+/// Driven by the event stream rather than by turn order, because that is the
+/// only thing the operator actually sees. `turn` shapes the reply, `ballot`
+/// the ballot answer; the responder runs until the debate ends.
+fn respond(
+    engine: Arc<Engine<Script>>,
+    rec: Arc<Recorder>,
+    turn: Box<dyn Fn(u64) -> HumanTurnSubmit + Send>,
+    ballot: Box<dyn Fn(BallotKind) -> HumanBallot + Send>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut acted_turns = std::collections::HashSet::new();
+        let mut acted_ballots = std::collections::HashSet::new();
+        loop {
+            let (mut next_turn, mut next_ballot) = (None, None);
+            {
+                let events = rec.events.lock().expect("events");
+                for e in events.iter() {
+                    match e {
+                        EngineEvent::YourTurn { turn, delegate, .. } => {
+                            let key = (turn.to_string(), delegate.clone());
+                            if acted_turns.insert(key) {
+                                next_turn = Some(*turn);
+                            }
+                        }
+                        EngineEvent::BallotAsked { kind, delegate, .. } => {
+                            if acted_ballots.insert((*kind, delegate.clone())) {
+                                next_ballot = Some(*kind);
+                            }
+                        }
+                        EngineEvent::DebateEnded { .. } | EngineEvent::Failed { fatal: true, .. } => {
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if let Some(t) = next_turn {
+                // A refusal is the operator's chance to fix it, so this panics
+                // rather than retrying: a test that silently resubmits a bad
+                // answer would pass for the wrong reason.
+                engine
+                    .submit_turn(turn(t))
+                    .unwrap_or_else(|e| panic!("human turn {t} refused: {e}"));
+            }
+            if let Some(k) = next_ballot {
+                engine
+                    .submit_ballot(ballot(k))
+                    .unwrap_or_else(|e| panic!("human {k:?} ballot refused: {e}"));
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+}
+
+fn human_turn(text: &str) -> HumanTurnSubmit {
+    HumanTurnSubmit {
+        text: text.into(),
+        thinking: String::new(),
+        calls: Vec::new(),
+    }
+}
+
+fn call_to(name: &str, args: serde_json::Value) -> RawToolCall {
+    RawToolCall {
+        id: "human".into(),
+        name: name.into(),
+        arguments: args,
+    }
+}
+
+/// Stopping a debate the operator is sitting in must skip, not fabricate.
+///
+/// `await_human_turn` classified cancellation as *answered* and fell through to
+/// its empty-response default. So the natural reaction to a prompt you do not want
+/// to answer — Stop — produced a full turn attributed to the seat, saying nothing
+/// and doing nothing, with a notice about an empty turn. The debate then carried an
+/// argument the operator never gave.
+#[tokio::test]
+async fn stopping_while_parked_on_a_taken_seat_skips_the_turn() {
+    let cfg = human_config("a");
+    let rec = Arc::new(Recorder::default());
+    let sink: Arc<dyn EventSink> = {
+        let rec = rec.clone();
+        Arc::new(move |e: EngineEvent| rec.emit(e))
+    };
+    let script = Arc::new(Script::new(vec![]));
+    let engine = Arc::new(Engine::with_backend(script.clone(), sink));
+    let runner = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.run(cfg).await })
+    };
+    // Wait until it really is parked, then stop — the same order the operator uses.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while engine.pending_prompt().is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the seat never parked");
+    assert!(
+        engine.pending_prompt().is_some(),
+        "the seat should be parked waiting for the operator"
+    );
+    engine.stop();
+
+    tokio::time::timeout(Duration::from_secs(10), runner)
+        .await
+        .expect("stopping a parked debate must not hang")
+        .expect("the debate thread panicked");
+
+    let events = rec.events.lock().expect("events").clone();
+    assert!(
+        events.iter().any(|e| matches!(e, EngineEvent::TurnSkipped { .. })),
+        "the turn should have been skipped, not answered: {events:?}"
+    );
+    let speeches = rec.speeches();
+    assert!(
+        !speeches.iter().any(|s| s.delegate == "a"),
+        "a stopped seat must not have a speech: {speeches:?}"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            EngineEvent::Notice { text, .. } if text.contains("empty turn")
+        )),
+        "stopping is not an empty turn, and must not be reported as one"
+    );
+}
+
+/// The closing address is asked for, not written for you.
+///
+/// `closing_address` was the one path that never checked `is_human` — the four
+/// ballot casts and `take_turn` all did. With closing statements on, a taken seat
+/// got a closing address written by whatever model had been configured for it and
+/// streamed into the transcript under the operator's name, without ever being asked.
+#[tokio::test]
+async fn a_taken_seat_is_asked_for_its_closing_address() {
+    let mut cfg = human_config("a");
+    cfg.closing_statements = true;
+    let rec = Arc::new(Recorder::default());
+    let sink: Arc<dyn EventSink> = {
+        let rec = rec.clone();
+        Arc::new(move |e: EngineEvent| rec.emit(e))
+    };
+    // Only the model seats' closings are scripted; the taken seat must not need one.
+    let script = Arc::new(Script::new(vec![
+        Script::call("make_point", json!({"text": "P1 claim"})),
+        Script::call("vote", json!({"point": 1, "verdict": "win"})),
+        Script::call("vote", json!({"point": 1, "verdict": "lose"})),
+        Script::text("round laid out"),
+        Script::text("I have nothing further."),
+        Script::text("Nor have I."),
+        Script::call(
+            "conclude",
+            json!({"agreed": false, "answer": "undetermined", "lean": "neither"}),
+        ),
+    ]));
+    let engine = Arc::new(Engine::with_backend(script.clone(), sink));
+    // Different text per turn, deliberately: with one answer for every prompt the
+    // round-1 speech satisfied the closing assertion and the test passed with the
+    // closing branch disabled entirely.
+    let responder = respond(
+        engine.clone(),
+        rec.clone(),
+        Box::new(|turn| {
+            if turn == 1 {
+                human_turn("To begin: the motion is arguable but weak.")
+            } else {
+                human_turn("IN-CLOSING: the motion should be refused.")
+            }
+        }),
+        Box::new(|_| unreachable!("no ballot is opened in this debate")),
+    );
+    engine.run(cfg).await;
+    responder.abort();
+
+    let speeches = rec.speeches();
+    assert!(
+        speeches
+            .iter()
+            .any(|s| s.delegate == "a" && s.text.contains("IN-CLOSING")),
+        "the operator's own closing address is missing: {speeches:?}"
+    );
+    assert!(
+        speeches
+            .iter()
+            .any(|s| s.delegate == "a" && s.text.contains("To begin")),
+        "precondition: the seat's first turn should still be there"
+    );
+    let asked: Vec<String> = script
+        .seen
+        .lock()
+        .expect("seen")
+        .iter()
+        .map(|r| r.model.clone())
+        .collect();
+    assert!(
+        !asked.iter().any(|m| m == "m-a"),
+        "the taken seat's closing came from a model: {asked:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_taken_seat_argues_its_own_turn_and_the_record_shows_it() {
+    // The whole feature in one test: the seat is marked human, the engine
+    // parks on it rather than calling a model, the speech lands on the
+    // transcript, and the debate carries on to the seats that are not.
+    let cfg = human_config("a");
+    let rec = Arc::new(Recorder::default());
+    let sink: Arc<dyn EventSink> = {
+        let rec = rec.clone();
+        Arc::new(move |e: EngineEvent| rec.emit(e))
+    };
+    let script = Arc::new(Script::new(vec![]));
+    let engine = Arc::new(Engine::with_backend(script.clone(), sink));
+    let responder = respond(
+        engine.clone(),
+        rec.clone(),
+        Box::new(|_| human_turn("I argue the motion, and I raise a point.")),
+        Box::new(|_| unreachable!("no ballot is opened in this debate")),
+    );
+    engine.run(cfg).await;
+    responder.abort();
+
+    let speeches = rec.speeches();
+    assert!(
+        speeches.iter().any(|s| s.delegate == "a" && s.text.contains("I argue the motion")),
+        "the operator's speech is missing: {speeches:?}"
+    );
+    // The models were never asked to argue for it: only the other two seats
+    // reached the backend, and `m-a` reached it never.
+    let asked: Vec<String> = script
+        .seen
+        .lock()
+        .expect("seen")
+        .iter()
+        .map(|r| r.model.clone())
+        .collect();
+    assert!(
+        !asked.iter().any(|m| m == "m-a"),
+        "the taken seat reached the backend: {asked:?}"
+    );
+    assert!(
+        asked.iter().any(|m| m == "m-b") && asked.iter().any(|m| m == "m-c"),
+        "the seats that are not taken should have argued: {asked:?}"
+    );
+    assert!(
+        rec.kinds().contains(&"yourTurn"),
+        "the turn must be announced as the operator's, not as a model's"
+    );
+    assert!(
+        rec.kinds().contains(&"ended"),
+        "the debate must finish on its own: {:?}",
+        rec.kinds()
+    );
+}
+
+#[tokio::test]
+async fn a_taken_seat_acts_on_the_board_with_the_pickers_calls() {
+    // The action picker emits ordinary tool calls, so they travel the same
+    // validation a model's do. Two actions here: raise a point, then vote on it.
+    let cfg = human_config("b");
+    let rec = Arc::new(Recorder::default());
+    let sink: Arc<dyn EventSink> = {
+        let rec = rec.clone();
+        Arc::new(move |e: EngineEvent| rec.emit(e))
+    };
+    let engine = Arc::new(Engine::with_backend(Arc::new(Script::new(vec![])), sink));
+    let responder = respond(
+        engine.clone(),
+        rec.clone(),
+        Box::new(|_| HumanTurnSubmit {
+            text: "A claim, and my vote on it.".into(),
+            thinking: String::new(),
+            calls: vec![
+                call_to("make_point", json!({ "text": "Lilies are cheaper per stem" })),
+                call_to("vote", json!({ "point": 1, "verdict": "win", "reason": "it is true" })),
+            ],
+        }),
+        Box::new(|_| unreachable!("no ballot is opened in this debate")),
+    );
+    engine.run(cfg).await;
+    responder.abort();
+
+    // The board accepted both calls and the vote landed on the point: the claim
+    // carries, 1 up and 0 down.
+    assert_eq!(rec.final_board(), vec![(1, "carried", 1)], "the point or vote is missing");
+    let texts: Vec<String> = rec.speeches().iter().map(|s| s.text.clone()).collect();
+    assert!(
+        texts.iter().any(|t| t.contains("A claim, and my vote on it.")),
+        "the operator's speech is missing: {texts:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_bad_call_is_refused_so_it_can_be_fixed_rather_than_lost() {
+    // The difference from a model: a mistyped vote is *rejected at submit*, so
+    // the operator sees why and can correct it. A model's is dropped. Here the
+    // refusal is the whole assertion — the turn must still be waiting.
+    let cfg = human_config("a");
+    let rec = Arc::new(Recorder::default());
+    let sink: Arc<dyn EventSink> = {
+        let rec = rec.clone();
+        Arc::new(move |e: EngineEvent| rec.emit(e))
+    };
+    let engine = Arc::new(Engine::with_backend(Arc::new(Script::new(vec![])), sink));
+
+    // Wait for the prompt, then submit three things that must all be refused.
+    let bad = engine.clone();
+    let rec2 = rec.clone();
+    tokio::spawn(async move {
+        loop {
+            let parked = rec2
+                .events
+                .lock()
+                .expect("events")
+                .iter()
+                .any(|e| matches!(e, EngineEvent::YourTurn { .. }));
+            if parked {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        // A point that does not exist.
+        let why = bad
+            .submit_turn(HumanTurnSubmit {
+                text: "voting into the void".into(),
+                thinking: String::new(),
+                calls: vec![call_to("vote", json!({ "point": 7, "verdict": "win" }))],
+            })
+            .expect_err("a vote on a point that does not exist must be refused");
+        assert!(why.contains("no point 7"), "{why}");
+        // An empty turn.
+        let why = bad
+            .submit_turn(human_turn("   "))
+            .expect_err("an empty turn must be refused");
+        assert!(why.contains("empty turn"), "{why}");
+        // A call the parser rejects outright.
+        let why = bad
+            .submit_turn(HumanTurnSubmit {
+                text: "bad argument".into(),
+                thinking: String::new(),
+                calls: vec![call_to("not_a_tool", json!({}))],
+            })
+            .expect_err("an unknown tool must be refused");
+        assert!(why.contains("not_a_tool"), "{why}");
+        // All three refused, so the turn is still the operator's to answer.
+        let pending = engine_pending(&bad);
+        assert!(
+            matches!(pending, Some(PendingPrompt::Turn { .. })),
+            "a refused submit must leave the turn waiting: {pending:?}"
+        );
+        // And the corrected answer is accepted.
+        bad.submit_turn(HumanTurnSubmit {
+            text: "Corrected: no claim to make, only a position.".into(),
+            thinking: String::new(),
+            calls: vec![],
+        })
+        .expect("a valid submit is accepted");
+    });
+
+    // Nothing will answer a ballot, so end the debate as soon as the turn is in.
+    let stopper = engine.clone();
+    tokio::spawn(async move {
+        loop {
+            if stopper.pending_prompt().is_some() {
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                stopper.stop();
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+    engine.run(cfg).await;
+
+    let texts: Vec<String> = rec.speeches().iter().map(|s| s.text.clone()).collect();
+    assert!(
+        texts.iter().any(|t| t.contains("Corrected:")),
+        "the corrected turn should be the one on the record: {texts:?}"
+    );
+    assert!(
+        !texts.iter().any(|t| t.contains("bad argument")),
+        "a refused submit must never reach the record: {texts:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_taken_turn_can_be_skipped_like_any_other() {
+    // Skip must reach a parked turn exactly as it reaches a request in flight:
+    // the round moves on, the seat loses its turn, and the debate ends.
+    let cfg = human_config("a");
+    let rec = Arc::new(Recorder::default());
+    let sink: Arc<dyn EventSink> = {
+        let rec = rec.clone();
+        Arc::new(move |e: EngineEvent| rec.emit(e))
+    };
+    let engine = Arc::new(Engine::with_backend(Arc::new(Script::new(vec![])), sink));
+    let skipper = {
+        let engine = engine.clone();
+        let rec = rec.clone();
+        tokio::spawn(async move {
+            loop {
+                let parked = rec
+                    .events
+                    .lock()
+                    .expect("events")
+                    .iter()
+                    .any(|e| matches!(e, EngineEvent::YourTurn { .. }));
+                if parked {
+                    assert!(engine.skip_turn(), "skip found no turn in flight");
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+    };
+    engine.run(cfg).await;
+    skipper.await.expect("skipper");
+
+    let kinds = rec.kinds();
+    assert!(kinds.contains(&"skipped"), "the skip was not recorded: {kinds:?}");
+    assert!(kinds.contains(&"ended"), "the debate did not finish: {kinds:?}");
+    // And nothing was recorded as said by the skipped seat.
+    assert!(
+        !rec
+            .speeches()
+            .iter()
+            .any(|s| s.delegate == "a" && !s.text.is_empty()),
+        "a skipped turn put words on the record"
+    );
+}
+
+#[tokio::test]
+async fn a_taken_seat_answers_its_own_poll() {
+    // A poll opened by a model seat reaches the operator's seat as a question,
+    // and their answer is counted like any other ballot.
+    let cfg = human_config("a");
+    let rec = Arc::new(Recorder::default());
+    let sink: Arc<dyn EventSink> = {
+        let rec = rec.clone();
+        Arc::new(move |e: EngineEvent| rec.emit(e))
+    };
+    // The Critic opens the poll; the operator's seat votes second.
+    let script = vec![
+        Script::call(
+            "poll",
+            json!({ "question": "Does the board help?", "options": ["yes", "no"] }),
+        ),
+    ];
+    let engine = Arc::new(Engine::with_backend(Arc::new(Script::new(script)), sink));
+    let responder = respond(
+        engine.clone(),
+        rec.clone(),
+        Box::new(|_| human_turn("I hold my position.")),
+        Box::new(|kind| {
+            assert_eq!(kind, BallotKind::Poll, "unexpected ballot kind");
+            HumanBallot::Poll {
+                choice: "no".into(),
+                reason: Some("the board records, it does not decide".into()),
+                confidence: Some(0.7),
+            }
+        }),
+    );
+    engine.run(cfg).await;
+    responder.abort();
+
+    let ballots: Vec<(String, String)> = rec
+        .events
+        .lock()
+        .expect("events")
+        .iter()
+        .filter_map(|e| match e {
+            EngineEvent::PollBallotCast { delegate, choice, .. } => Some((delegate.clone(), choice.clone())),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        ballots.iter().any(|(d, c)| d == "a" && c == "no"),
+        "the operator's ballot was not counted: {ballots:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_taken_seat_answers_the_deadlock_review() {
+    // The reading is what matters here: the operator's vote on the reading is
+    // recorded, and a changed vote on the point rides the same answer.
+    let rec = Arc::new(Recorder::default());
+    let sink: Arc<dyn EventSink> = {
+        let rec = rec.clone();
+        Arc::new(move |e: EngineEvent| rec.emit(e))
+    };
+    // Two models split P1 into a stalemate; the Critic opens the review in round
+    // two and the operator's seat is asked to rule on why. The script is
+    // written out turn by turn — including the summarizer's intermission, which
+    // is a request like any other — because a test that assumed only the
+    // arguing seats consumed replies would silently vote the summarizer's turn
+    // with somebody else's reply.
+    let mut cfg = human_config("a");
+    cfg.max_rounds = 2;
+    let script = vec![
+        // Round one: the taken seat answers (no reply consumed), then Critic
+        // raises the claim and Arbiter votes against it — 1 up, 1 down.
+        Script::call("make_point", json!({ "text": "Lilies are cheaper per stem" })),
+        Script::call("vote", json!({ "point": 1, "verdict": "lose" })),
+        // The intermission.
+        Script::text("Round one laid out: one claim, split down the middle."),
+        // Round two: the Critic opens the review. It asks the seats that may
+        // vote, and the taken seat comes first in roster order, so it is asked
+        // before the Arbiter's reply below.
+        Script::call("review", json!({ "point": 1 })),
+        Script::call(
+            "stalemate_ballot",
+            json!({ "reading": "decidable", "reason": "one more argument settles it" }),
+        ),
+    ];
+    let engine = Arc::new(Engine::with_backend(Arc::new(Script::new(script)), sink));
+    let responder = respond(
+        engine.clone(),
+        rec.clone(),
+        Box::new(|_| human_turn("I rule on the deadlock.")),
+        Box::new(|kind| {
+            assert_eq!(kind, BallotKind::Review);
+            HumanBallot::Review {
+                reading: StalemateReading::Decidable,
+                reason: Some("one more argument would settle it".into()),
+                vote: Some(Verdict::Win),
+            }
+        }),
+    );
+    engine.run(cfg).await;
+    responder.abort();
+
+    let ballots: Vec<(String, String)> = rec
+        .events
+        .lock()
+        .expect("events")
+        .iter()
+        .filter_map(|e| match e {
+            EngineEvent::ReviewBallotCast { delegate, reading, .. } => {
+                Some((delegate.clone(), format!("{reading:?}")))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        ballots.iter().any(|(d, r)| d == "a" && r == "Decidable"),
+        "the operator's reading was not counted: {ballots:?}"
+    );
+    // The vote carried in the same breath applied to the point. A review-ballot
+    // change is not an action on a turn, so it has no `actionTaken` of its own:
+    // it shows on the tally. The point was split 1-1; the operator's change to
+    // win with the Arbiter's reading makes it 2 up, 1 down.
+    assert_eq!(
+        rec.final_board(),
+        vec![(1, "carried", 1)],
+        "the vote carried with the reading was not applied to the point"
+    );
+}
+
+#[tokio::test]
+async fn a_taken_seat_is_never_asked_as_judge_or_summarizer() {
+    // The rule is enforced by validation, not by the UI: a judge or summarizer
+    // marked taken is refused before any request is made.
+    for role in [SeatRole::Judge, SeatRole::Summarizer] {
+        let mut cfg = config();
+        let d = cfg
+            .delegates
+            .iter_mut()
+            .find(|d| d.seat_role == role)
+            .expect("the council has that role");
+        d.human = true;
+        let rec = Arc::new(Recorder::default());
+        let sink: Arc<dyn EventSink> = {
+            let rec = rec.clone();
+            Arc::new(move |e: EngineEvent| rec.emit(e))
+        };
+        Engine::with_backend(Arc::new(Script::new(vec![])), sink).run(cfg).await;
+        let failures = rec.failures();
+        assert!(
+            failures.iter().any(|f| f.contains("only arguing seats can be taken")),
+            "{role:?} was allowed: {failures:?}"
+        );
+        // Refused before any turn began: the only event is the refusal itself.
+        let kinds = rec.kinds();
+        assert!(
+            !kinds.iter().any(|k| k.contains(&"turn") || k.contains("speech")),
+            "{role:?} was refused but the council still ran: {kinds:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_taken_seat_needs_no_model_or_endpoint() {
+    // The converse: marking a seat taken is what makes the model requirement
+    // go away. A blank model on a *model* seat is still refused, so the flag is
+    // doing the work rather than the field merely being ignored.
+    let mut blank = config();
+    blank.max_rounds = 1;
+    let d = blank.delegates.iter_mut().find(|d| d.id == "a").expect("a seat");
+    d.model = String::new();
+    let rec = Arc::new(Recorder::default());
+    let sink: Arc<dyn EventSink> = {
+        let rec = rec.clone();
+        Arc::new(move |e: EngineEvent| rec.emit(e))
+    };
+    Engine::with_backend(Arc::new(Script::new(vec![])), sink)
+        .run(blank)
+        .await;
+    assert!(
+        rec.failures()
+            .iter()
+            .any(|f| f.contains("no model selected")),
+        "a blank model on a model seat must still be refused: {:?}",
+        rec.failures()
+    );
+}
+
+#[tokio::test]
+async fn a_reload_during_a_taken_turn_carries_the_pending_prompt() {
+    // The engine is parked waiting, so a snapshot must say so: otherwise a
+    // reload shows an empty chamber while the debate runs on behind it, and
+    // the operator never learns the council is waiting for them.
+    let cfg = human_config("a");
+    let rec = Arc::new(Recorder::default());
+    let sink: Arc<dyn EventSink> = {
+        let rec = rec.clone();
+        Arc::new(move |e: EngineEvent| rec.emit(e))
+    };
+    let engine = Arc::new(Engine::with_backend(Arc::new(Script::new(vec![])), sink));
+    // The snapshot is taken *while* the turn is parked, which is the only
+    // moment it matters: stopping the debate releases the prompt, so a
+    // snapshot afterwards would correctly report nothing pending.
+    let watcher = {
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            loop {
+                if engine.pending_prompt().is_some() {
+                    return engine.snapshot();
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+    };
+    let stopper = {
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            loop {
+                if engine.pending_prompt().is_some() {
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    engine.stop();
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+    };
+    engine.run(cfg).await;
+
+    let snap = watcher.await.expect("watcher");
+    match &snap.pending {
+        Some(PendingPrompt::Turn { delegate, .. }) => assert_eq!(delegate, "a", "{snap:?}"),
+        other => panic!("the snapshot did not carry the pending turn: {other:?}"),
+    }
+    // And the debate is still running while it waits: a remount that adopts
+    // this snapshot sees an unfinished council, not a finished one.
+    assert!(!snap.finished, "a parked debate read as finished");
+    stopper.abort();
+}
+
+/// The engine's pending prompt, read through the public API.
+fn engine_pending(engine: &Engine<Script>) -> Option<PendingPrompt> {
+    engine.pending_prompt()
+}
+
+/// A local model that starts repeating itself on the third turn.
+///
+/// Every local model but one started looping around the third turn of round one,
+/// and it was not the models: it was the shape of what we were sending.
+///
+/// `prune_superseded_briefs` drops the user turn that asked the question, and
+/// `finish_turn` pushes the delegate's reply after it — so from turn three the
+/// history was `system, user, assistant, assistant, user`. Two assistants in a
+/// row is not a shape any chat template is written for, and it is worst when
+/// both are empty, which is what a model that only made tool calls leaves behind.
+///
+/// The engine's own state machine was never wrong, so every test above passed
+/// with a request no local server would render sanely. This one looks at the
+/// wire shape, which is the only place this failure is visible.
+#[tokio::test]
+async fn a_delegate_history_never_puts_two_assistant_turns_in_a_row() {
+    // The shape only appears from a seat's *third* turn: turn 1 ends
+    // `[system, opening, brief1, a1]`, turn 2 ends `[system, opening, a1, brief2]`
+    // because the prune removed brief1, and turn 3 ends `[system, opening, a1, a2,
+    // brief3]` — a1 and a2 adjacent. So this needs at least three rounds and a
+    // seat that speaks in all of them. `max_rounds = 1` here made the old version
+    // of this test vacuous: every seat spoke once, so the run could not form and
+    // the assertion could not fail. Three rounds, and the debate must reach them.
+    let mut cfg = config();
+    cfg.max_rounds = 3;
+    cfg.closing_statements = false;
+    // Enough script for every seat to speak in all three rounds plus the
+    // confirmation ballots those votes trigger. The engine drains the script in
+    // order, so the tail being generous costs nothing.
+    let mut script: Vec<ChatResponse> = Vec::new();
+    for round in 1..=3u32 {
+        // A tool-only reply: `finish_turn` writes no prose for it, so the
+        // history grows an *empty* assistant message. Two of those adjacent is
+        // the degenerate case the models actually fell apart on.
+        script.push(Script::call(
+            "rebut",
+            json!({ "argument": format!("round {round}: the claim is unfalsifiable as stated") }),
+        ));
+        script.push(Script::text(&format!(
+            "Round {round}: I stand by the record as it stands."
+        )));
+    }
+    let rec = Arc::new(Recorder::default());
+    let backend = Arc::new(Script::new(script));
+    let sink: Arc<dyn EventSink> = {
+        let rec = rec.clone();
+        Arc::new(move |e: EngineEvent| rec.emit(e))
+    };
+    Engine::with_backend(backend.clone(), sink).run(cfg).await;
+
+    // Count how many *speaking* requests each seat made. The bug needs a run of
+    // assistants, which needs a seat on its third turn, so the test must first
+    // establish that a seat really did speak three times — otherwise this is a
+    // test that passes because nothing happened.
+    let seen = backend.seen.lock().expect("seen");
+    let mut speeches_per_seat: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for req in seen.iter() {
+        // A request carrying a turn brief is a speaking turn; a ballot has none.
+        if req.messages
+            .iter()
+            .any(|m| m.role == "user" && m.content.contains("You have the floor"))
+        {
+            *speeches_per_seat.entry(req.model.clone()).or_default() += 1;
+        }
+    }
+    let deepest = speeches_per_seat.values().copied().max().unwrap_or(0);
+    assert!(
+        deepest >= 3,
+        "this test only means something if a seat speaks on its third turn; deepest seat spoke {deepest} times ({speeches_per_seat:?})"
+    );
+
+    let mut checked = 0;
+    for req in seen.iter() {
+        let roles: Vec<&str> = req.messages.iter().map(|m| m.role.as_str()).collect();
+        for (i, pair) in roles.windows(2).enumerate() {
+            assert!(
+                !(pair[0] == "assistant" && pair[1] == "assistant"),
+                "{} was sent two assistant turns in a row on request {i}: {roles:?}",
+                req.model
+            );
+        }
+        // The specific degenerate case: an empty assistant must never be sent at
+        // all. Anthropic 400s on it, and a template sees "you said nothing".
+        for (i, m) in req.messages.iter().enumerate() {
+            if m.role == "assistant" {
+                assert!(
+                    !m.content.trim().is_empty(),
+                    "{} was sent an empty assistant message at {i}: {roles:?}",
+                    req.model
+                );
+            }
+        }
+        checked += 1;
+    }
+    assert!(checked >= 5, "expected several requests to inspect, got {checked}");
 }

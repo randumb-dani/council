@@ -2,9 +2,10 @@
 
 A council chamber for many models at once.
 
-Point a motion at two or more models served by any OpenAI-compatible endpoint
-(Unsloth Studio, llama.cpp, vLLM, LM Studio, Ollama, OpenRouter, OpenAI) and
-let them argue it out. Every model raises claims onto a shared **board**, and
+Point a motion at two or more models served by an OpenAI-compatible endpoint
+(Unsloth Studio, llama.cpp, vLLM, LM Studio, Ollama, OpenRouter, OpenAI) or by
+Anthropic’s Messages API, and let them argue it out. Endpoints can be mixed in
+one council. Every model raises claims onto a shared **board**, and
 every model rates every claim **win / lose / stalemate**. Concede what you have
 lost, poll the room when argument stalls, and when the debate closes you get a
 verdict that was computed from the board rather than summarised from vibes.
@@ -120,6 +121,64 @@ npm run dev
 Opened in a plain browser (not inside Tauri) the app runs a scripted stand-in
 debate so the interface is usable without an endpoint. It says so in a banner.
 
+### Serve it on this machine
+
+```bash
+npm run build        # produce dist/ first
+npm run serve        # UI + engine on http://127.0.0.1:1427
+```
+
+`council-serve` (`crates/council-serve/`) serves the built UI and exposes the
+real engine over same-origin REST plus a server-sent-events stream, so a
+browser on this machine runs real debates with no Tauri
+involved. The banner reads "Local server" instead of "Browser preview", model
+probing works, and reloading mid-debate reattaches to the running council.
+
+Three rules, all deliberate:
+
+- **Loopback by default.** Binds `127.0.0.1:1427` by default (`COUNCIL_SERVE_ADDR`
+  overrides, `COUNCIL_DIST_DIR` points at another UI build). Anything that is
+  not a loopback address is refused unless `COUNCIL_SERVE_ALLOW_REMOTE=1` is
+  set explicitly.
+- **Keys live on the server.** The browser sends endpoint profiles with blank
+  keys; the server merges secrets from `~/.config/council/endpoints.json`
+  (owner-only permissions, `COUNCIL_ENDPOINTS_FILE` overrides) and rejects any
+  request carrying a key. Store each key under Endpoints first — the panel
+  reports presence only, never the value.
+- **One debate at a time.** Like the desktop app, a second start gets a 409
+  and every tab watches the same stream. A subscriber that falls behind gets
+  a resync marker and the UI refetches the authoritative snapshot.
+
+The same UI installs as a PWA (manifest, icons, service worker) for a
+phone-like shell. Installing does not remove the server requirement: the
+engine runs in `council-serve` on this machine, so the app says plainly when
+the server is not reachable. The service worker never caches `/api/` — a
+cached event stream would replay a dead debate.
+
+### Serve it to another device on the LAN
+
+```bash
+npm run build                                          # produce dist/ first
+COUNCIL_SERVE_ALLOW_REMOTE=1 COUNCIL_SERVE_ADDR=192.168.1.50:1427 npm run serve
+```
+
+Both devices need to be on the same network, and the phone needs the machine's
+address to be reachable from it — a guest or isolated wifi may not allow that,
+and no amount of configuration here will change it. The UI served is the same
+responsive UI as on desktop.
+
+**There is no password.** Anything that can reach the address can drive the
+debate, submit turns as the operator, and rewrite the stored provider keys.
+That is a deliberate trade for a trusted home LAN, and it is why the network
+bind stays opt-in behind `COUNCIL_SERVE_ALLOW_REMOTE=1`: a typo cannot publish
+the keys by accident. If this ever needs to face anything wider than a network
+you trust, put it behind a reverse proxy that does authentication.
+
+A phone browser on `http://` cannot register a service worker — it needs a
+secure origin, and there is no certificate here. The app works; what is lost is
+the installable shell and offline start. Every other feature, including the
+live stream, works over plain HTTP.
+
 ---
 
 ## Connecting to Unsloth Studio
@@ -156,6 +215,25 @@ Three Unsloth-specific gotchas, all handled but worth knowing:
 Note that `npm run dev` in a plain browser never contacts an endpoint — it runs
 the scripted stand-in. Use `npm run tauri dev` for the real thing.
 
+### Model providers
+
+Each endpoint chooses one API shape. OpenAI-compatible servers keep the
+existing `/chat/completions` route; Anthropic endpoints use `/v1/messages`
+with `x-api-key` and `anthropic-version: 2023-06-01`.
+
+For Anthropic in this release:
+
+- `max_tokens` is required by Anthropic, so the engine sends a 16,000-token
+  output ceiling. That is an output limit, not a context-window size — and it
+  has to be a number the API *accepts*: the Messages API validates it against
+  the model’s maximum output and returns 400 rather than clamping, so the
+  former 200,000 made every Anthropic seat fail on every turn.
+- Temperatures above 1 are clamped to Anthropic’s accepted range.
+- Returned thinking is displayed, but Anthropic thinking controls are not sent.
+- Tool definitions are translated to Anthropic `input_schema`, and tool results
+  continue to be handled locally by the council.
+- Image attachments become Anthropic base64 image blocks.
+
 ---
 
 ## Layout
@@ -165,6 +243,7 @@ crates/council-core/     the engine — no Tauri, no UI, fully testable
   types.rs               the board: points, votes, tallies, polls, verdicts
   tools.rs               tool schemas + a deliberately lenient argument parser
   client.rs              OpenAI-compatible streaming client (SSE, tool deltas)
+  anthropic.rs           Anthropic Messages client behind the same backend contract
   prompt.rs              system prompt and the per-turn board snapshot
   engine.rs              the loop: turns, rounds, polls, closing, verdict
   web.rs                 the reference shelf (Wikipedia/Wiktionary), allow-listed
@@ -313,26 +392,35 @@ happened. An *adjournment*, by contrast, ends the debate at once.
 
 ---
 
-## The essential seats
+## The essential delegates
 
-A council is five fixed seats plus any number of seats you add yourself.
+A council is five fixed delegates plus any number you add yourself.
 
-| seat | what it does |
+| delegate | what it does |
 |---|---|
-| **Advocate** (proponent) | makes the case |
-| **Critic** (opponent) | steelmans the other side, then attacks it |
-| **Arbiter** (judge) | rules: one vote a turn, plus the power to settle a point outright |
-| **Rationale** (rationale) | finds logical fallacies; argues and votes, sitting after the Arbiter |
-| **Summarizer** | lays out each round and the end result; never argues |
+| **Advocate** (`proponent`) | argues for the motion and raises the points it wants to win |
+| **Critic** (`opponent`) | argues against it, steelmanning the other side first — that is, stating it as well as its own advocate would |
+| **Arbiter** (`judge`) | votes on each point once the argument is over, and can settle one outright regardless of the vote |
+| **Rationale** (`rationale`) | looks for weaknesses — contradictions, unsupported claims, conclusions that do not follow; argues and votes, after the Arbiter |
+| **Summarizer** | keeps track of what happened and writes the answer at the end; never argues |
 
-Their labels are fixed and they cannot be removed — everything else about a
-seat (model, endpoint, role line, voice, temperature) configures like any
-other. Added seats are **custom**: they argue, vote, poll and take turns in
-normal seat order. The engine refuses to convene a setup that is missing one
-of the four convening essentials or seats two of one; the Rationale is
-permanent furniture but optional, so at most one may sit and a council without
-one still convenes. Saved setups predate it, so one is appended (or your
-custom seat named Rationale promoted in place) the next time the setup loads.
+Their names are fixed and they cannot be removed — everything else about a
+delegate (model, server, role line, style, temperature) configures like any
+other. Added delegates are **custom**: they argue, vote, poll and take turns in
+the usual order. A debate will not start without one of the four required
+delegates, or with fewer than two in all; the Rationale is permanent furniture
+but optional, so at most one may sit and a council without one still runs.
+Saved setups predate it, so one is appended (or your custom delegate named
+Rationale promoted in place) the next time the setup loads.
+
+### Naming
+
+The app says **delegate** for a model at the table and **council** for the
+group. It used to alternate between "delegate", "seat" and "council" for the
+same object, sometimes within one screen, and "seat" survived in the code as
+`seatRole`, `seatSlots()` and the `--seat-N` CSS variables — that is internal
+plumbing and is named for the slot a delegate occupies, not for the user-facing
+noun.
 
 The Summarizer never argues. It takes no round turn, casts no poll, review or
 adjournment ballot, and cannot move to adjourn — its instrument is the record.
@@ -441,15 +529,64 @@ the invented one at least stays consistent.
 
 Attach up to six images to the motion and every seat sees them with its
 opening message, named Image 1..N. They ride along as `image_url` parts on a
-standard OpenAI-compatible request, so anything that serves a vision-capable
-model (llama.cpp with a multimodal model, vLLM, OpenRouter, OpenAI) works
-unchanged — but a text-only model will fail the turn instead, so point image
-seats at vision models.
+standard OpenAI-compatible request and as base64 image blocks on an Anthropic
+Messages request, so anything that serves a vision-capable model (llama.cpp
+with a multimodal model, vLLM, OpenRouter, OpenAI, Anthropic) works unchanged —
+but a text-only model will fail the turn instead, so point image seats at
+vision models.
 
 Two practical limits: picks are downscaled to 1568px JPEG on the way in, so a
 phone photo bills hundreds of image tokens rather than thousands, and image
 *bytes* never reach the library or the exports — the record keeps the file
-names, not the files.
+names, not the files. Clipboard screenshots paste straight in from anywhere
+outside a text field.
+
+## Themes
+
+Eight, from the palette button in either header.
+
+| theme | what it is |
+|---|---|
+| **Sage dark** / **Sage light** | the original green, for a dark room or for daylight |
+| **Amber** / **Amber light** | the same ladder rotated to warm, for a dark room or for daylight |
+| **Slate** / **Slate light** | graphite's grey-blue cousin — one steel-blue accent, for a dark room or for daylight |
+| **Graphite** | neutral greys; seats read by lightness, verdicts in muted colour |
+| **Monochrome high contrast** | black on white, borders at 3:1, verdicts in muted colour |
+
+A theme is a set of CSS custom properties and nothing else — no component
+knows one exists, so a new one is a block in `index.css` plus a line in
+`src/themes.ts`. `themes.test.ts` enforces the part that is easy to get wrong:
+custom properties *inherit*, so a theme that forgets `--warn` does not fail, it
+silently keeps the previous theme's warn. Every theme must define every token.
+
+### Identity without colour
+
+The five essentials are near-identical teals, which stops working the moment hue
+goes. Delegate identity therefore never depends on colour alone:
+
+- **`--seat-1` … `--seat-12`** is a ramp. Six themes define it — Graphite and
+  Monochrome as greys stepped evenly in relative luminance, Amber and Slate as
+  twelve saturated oranges and slate-blues separated in OKLab, each with a light
+  twin stepped toward the dark end for its pale canvas — because a teal disc on
+  an amber board gives the theme away. Components read
+  `var(--seat-3, <the delegate's own colour>)`, so a theme with no ramp leaves
+  each delegate its own colour and the others override it. Every step clears
+  2.5:1 against its canvas; the darkest Graphite step sits at 2.81:1.
+- **`--seat-ink-1` … `--seat-ink-12`** sits beside each step, giving the glyph
+  whichever of the theme's two inks actually wins on that disc. Without it the
+  glyph's colour had to be computed from the *stored* colour while the disc came
+  from the ramp — which is how a dark amber step ended up with ink chosen for a
+  teal. The worst glyph contrast is 3.96:1, in Amber: a saturated mid-tone
+  orange is the one colour where neither near-black nor cream separates well,
+  and it is comfortably inside the 3:1 large-text bar.
+- **Every delegate carries a mark** — `A`dvocate, `C`ritic, a`R`biter,
+  ra`N`tional(e), `S`ummarizer — on its avatar. This also fixes a plain bug: the
+  avatar used to show the first letter of the label, which put Advocate and
+  Arbiter both on an "A".
+- **win / lose / stalemate** are spaced far apart in the monochrome themes, so
+  the board's spread bars stay readable with colour removed. The glyphs are
+  accompanied by words in every tooltip and screen-reader label, since `▲` says
+  nothing to anyone not already fluent in the board.
 
 ## The library
 
@@ -508,7 +645,7 @@ Six rounds is twenty-four speeches. What the reader adds:
 
 ## Counting what it costs
 
-Per endpoint, **count tokens** is on by default. A streamed response only
+Per endpoint, **count words** is on by default. A streamed response only
 reports usage when `stream_options.include_usage` is set, and a server that does
 not know the field rejects the whole request rather than ignoring it — so when
 that happens the engine asks once more without it, remembers the refusal for
@@ -524,10 +661,10 @@ does not answer, so the two are never confused.
 ## Running the checks
 
 ```sh
-npm test           # core (rust) + export formats (node) + tsc
+npm test           # core (rust) + web (node) + tsc
 npm run test:core  # rust only, TLS off — needs no C compiler
 npm run test:tls   # rust with TLS, the default — needs a working C compiler
-npm run test:web   # the export formats only
+npm run test:web   # the node tests: exports, themes, user-facing copy, provider defaults
 ```
 
 `test:core` runs with `--no-default-features` because TLS pulls in `ring`, which
@@ -535,9 +672,27 @@ wants a C toolchain. That is the only reason for the flag: the engine itself
 does everything over plain HTTP, and CI has no compiler. `test:tls` covers the
 TLS path when you have one.
 
-`npm run test:web` covers the export formats, which are the only artifacts a
-debate leaves by hand: a `|` or a newline in a claim silently corrupting a
-Markdown table is exactly the sort of thing a test should catch.
+`npm run test:web` covers the three things a bug in which is invisible rather
+than loud.
+
+The **export formats**, because a `|` or a newline in a claim silently corrupts
+a Markdown table.
+
+The **themes**: custom properties inherit, so a theme that omits a token does
+not error — it quietly keeps the previous theme's value, which shows up as one
+stray colour in an otherwise grey board. `themes.test.ts` parses `index.css` and
+fails if any theme is missing any token, if a theme defines a seat ramp it did
+not claim, if a ramp step is invisible against its own canvas, if the declared
+glyph ink is not the one that measures better, or if a `[data-theme]` selector is
+written against a theme that no longer exists.
+
+The **copy**: the engine names things `make_point`, `win` and `proponent`, and
+showing one to a reader is a bug that renders perfectly — it is just a string,
+so review passes and the panel says "2 make_point". `copy.test.ts` fails if a
+raw verdict, `SeatRole` value or engine action tag reaches a tooltip, if a
+tooltip runs past 200 characters (a native `title` is one line and cannot render
+a newline), if the word "seat" appears in quoted copy, or if the action-label
+fallback stops being a word and reverts to the tag.
 
 ## The Arbiter rules
 
@@ -613,7 +768,30 @@ does not keep is worse than no promise, so:
 - a seat is **told when the server cut its reply short**, because a lost vote and
   a deliberate abstention are different facts and one of them moves a majority
 
-## Extra seats
+## Reasoning effort
+
+Except on Anthropic, each endpoint carries a "how much should the model think"
+level and, separately, *how that server expects to receive it* — there is no
+standard, and a value the server does not recognise is rejected rather than
+ignored. That is why the setup panel offers a shape selector ("let the server
+decide", "send as a template argument", "send as a top-level field") rather
+than guessing.
+
+Known quirks, kept out of the UI because a native tooltip cannot render a
+newline and a user cannot act on a GitHub issue number:
+
+- **Qwen3.5/3.6/3.8** accept `low`, `medium`, `xhigh`.
+- **OpenAI** accepts `low`, `medium`, `high`.
+- **DeepSeek** adds `max`.
+- **Qwen3.8 defaults to `xhigh`**, which returns an empty answer on roughly one
+  call in five under llama.cpp (`QwenLM/Qwen3.8#216`). `low` and `medium` were
+  clean. If a Qwen3.8 model returns nothing, this is the first thing to check.
+- **llama-server has no top-level `reasoning_effort` at all** (`llama.cpp#20408`),
+  so on that runtime use the template-argument shape instead.
+- **Anthropic thinking controls are not sent yet.** Returned thinking is
+  displayed, but its model-specific settings vary too much to guess safely.
+
+## Extra delegates
 
 Up to six can join the five fixed seats. They argue, vote, and read; they are not
 offered `rule`, because that belongs to the Arbiter alone.
