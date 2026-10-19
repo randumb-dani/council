@@ -45,8 +45,7 @@ src-tauri/gen
 *.key
 *.p12
 
-# Stale pre-rewrite duplicates of src/ (older App.tsx / CouncilRail.tsx).
-# Safe to delete — git has never tracked them.
+# Tooling artifacts
 coverage
 *.tsbuildinfo
 .vite

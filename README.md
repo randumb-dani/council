@@ -11,7 +11,7 @@ lost, poll the room when argument stalls, and when the debate closes you get a
 verdict that was computed from the board rather than summarised from vibes.
 
 Tauri v2 + React + TypeScript. Flat surfaces, one accent colour, and a council
-rail that tells you who has said what — no 3D, no renders. Linux and Windows.
+rail that tells you who has said what — no 3D, no renders. Linux, Windows and macOS.
 
 ---
 
@@ -249,12 +249,16 @@ crates/council-core/     the engine — no Tauri, no UI, fully testable
   web.rs                 the reference shelf (Wikipedia/Wiktionary), allow-listed
   decide.rs              decision-model ballots (Jev-style classification)
   events.rs              the event stream the UI renders from, and nothing else
+crates/council-serve/    the local server: built UI + engine over REST/SSE, no Tauri
 src-tauri/               a thin bridge — start, stop, interject, forward events
 src/                     React UI
   useCouncil.ts          the reducer that accumulates the event stream
   debates.ts             the library: storing, summaries, Markdown/JSON export
-  bridge.ts              Tauri invoke + event subscription (scripted stand-in outside Tauri)
-  components/            council rail, setup, transcript, board, record, reader
+  bridge.ts              one front door: Tauri, the local server, or a scripted stand-in
+  serverBridge.ts        talking to council-serve: key status, live stream, resync
+  configStore.ts         endpoints and procedure, persisted locally
+  themes.ts              the eight themes and their seat ramps
+  components/            rail, setup, transcript, board, record, reader, operator, themes
 ```
 
 The Rust engine is authoritative. The webview never scores a point, never
@@ -590,9 +594,9 @@ goes. Delegate identity therefore never depends on colour alone:
 
 ## The library
 
-A debate is four models and however many rounds you afforded it. Until this
-existed it lived only in the window: closing the app lost it, and there was no
-way to take it anywhere else.
+A debate is five fixed delegates plus any you add, and however many rounds you
+afforded it. Until this existed it lived only in the window: closing the app lost
+it, and there was no way to take it anywhere else.
 
 There are three places to be, reachable by the address bar and by the back
 button:
@@ -661,8 +665,9 @@ does not answer, so the two are never confused.
 ## Running the checks
 
 ```sh
-npm test           # core (rust) + web (node) + tsc
+npm test           # core (rust) + serve (rust) + web (node) + tsc
 npm run test:core  # rust only, TLS off — needs no C compiler
+npm run test:serve # council-serve's own tests, TLS off
 npm run test:tls   # rust with TLS, the default — needs a working C compiler
 npm run test:web   # the node tests: exports, themes, user-facing copy, provider defaults
 ```
